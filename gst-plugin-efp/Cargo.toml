@@ -1,0 +1,18 @@
+[package]
+name = "gst-plugin-efp"
+version = "0.1.0"
+edition = "2021"
+description = "GStreamer plugin for EFP muxing and demuxing"
+license = "MIT"
+repository = "https://github.com/eyevinn/efp"
+
+[dependencies]
+efp = { path = "../efp" }
+glib = "0.22"
+gst = { package = "gstreamer", version = "0.25" }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

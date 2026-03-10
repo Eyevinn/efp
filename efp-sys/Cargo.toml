@@ -1,0 +1,11 @@
+[package]
+name = "efp-sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to the Elastic Frame Protocol (EFP) C library"
+license = "MIT"
+links = "efp"
+
+[build-dependencies]
+bindgen = "0.71"
+cmake = "0.1"

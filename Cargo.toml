@@ -1,0 +1,3 @@
+[workspace]
+members = ["efp-sys", "efp", "gst-plugin-efp"]
+resolver = "2"

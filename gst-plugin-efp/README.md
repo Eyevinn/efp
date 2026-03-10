@@ -50,9 +50,23 @@ This framing allows transport over any reliable bytestream (TCP, SRT, pipes).
 
 ## Flush and discontinuity handling
 
-- **DISCONT flag**: The demux reinitializes the EFP receiver on discontinuity to prevent assembling frames from fragments spanning the gap.
-- **Flush events**: FlushStart is forwarded to all src pads. FlushStop reinitializes the receiver and forwards downstream.
+- **DISCONT flag**: The demux reinitializes the EFP receiver on discontinuity to prevent assembling frames from fragments spanning the gap. The first buffer on each new src pad is marked DISCONT.
+- **Flush events**: Both mux and demux handle FlushStart/FlushStop. The mux re-creates the EFP sender and the demux re-creates the receiver to discard stale state.
 - **EOS**: The mux waits for EOS on all sink pads before forwarding.
+
+## Keyframe gating
+
+For H.264 and H.265 streams, the demux waits for a keyframe (IDR/CRA/BLA) before pushing buffers on a newly created src pad. This prevents decoder errors from starting mid-stream. Non-video content types are passed through immediately.
+
+## Latency and timing
+
+- **Latency query**: The demux reports reassembly latency based on `(bucket-timeout + hol-timeout) * 10 ms`, allowing downstream elements to account for it.
+- **Segment adjustment**: When the first PTS on a pad carries a large offset (> 10 s), the demux updates the segment start so downstream running-time begins near zero.
+
+## Upstream event handling (efpmux)
+
+- **QoS**: Swallowed — the mux cannot meaningfully translate QoS back to individual input streams.
+- **Force Key Unit**: Forwarded to all sink pads so upstream encoders can produce keyframes on demand.
 
 ## Stream IDs
 

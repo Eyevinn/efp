@@ -93,7 +93,12 @@ impl ObjectSubclass for EfpMux {
 
     fn with_class(klass: &Self::Class) -> Self {
         let templ = klass.pad_template("src").unwrap();
-        let srcpad = gst::Pad::builder_from_template(&templ).build();
+        let srcpad = gst::Pad::builder_from_template(&templ)
+            .event_function(|pad, parent, event| {
+                let element = parent.unwrap().downcast_ref::<super::EfpMux>().unwrap();
+                element.imp().src_event(pad, event)
+            })
+            .build();
 
         Self {
             srcpad,
@@ -296,6 +301,11 @@ impl EfpMux {
         self.srcpad.push_event(gst::event::Segment::new(&segment));
     }
 
+    /// Collect a snapshot of sink pads without holding the lock.
+    fn sink_pad_snapshot(&self) -> Vec<gst::Pad> {
+        self.pads.lock().unwrap().keys().cloned().collect()
+    }
+
     fn sink_chain(
         &self,
         pad: &gst::Pad,
@@ -304,11 +314,17 @@ impl EfpMux {
         self.ensure_src_setup();
 
         let state_guard = self.state.lock().unwrap();
-        let state = state_guard.as_ref().ok_or(gst::FlowError::NotNegotiated)?;
+        let state = match state_guard.as_ref() {
+            Some(s) => s,
+            None => return Err(gst::FlowError::NotNegotiated),
+        };
 
         let (stream_id, content_type) = {
             let pads = self.pads.lock().unwrap();
-            let ps = pads.get(pad).ok_or(gst::FlowError::Error)?;
+            let ps = match pads.get(pad) {
+                Some(ps) => ps,
+                None => return Err(gst::FlowError::Error),
+            };
             (ps.stream_id, ps.content_type)
         };
 
@@ -317,20 +333,18 @@ impl EfpMux {
         let dts = buffer.dts().map_or(0, |t| t.nseconds());
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
-        state
+        if let Err(_e) = state
             .sender
             .send(map.as_slice(), content_type, pts, dts, 0, stream_id, 0)
-            .map_err(|_| gst::FlowError::Error)?;
+        {
+            return Err(gst::FlowError::Error);
+        }
 
         let data = {
             let mut pending = state.pending.lock().unwrap();
             if pending.is_empty() {
                 return Ok(gst::FlowSuccess::Ok);
             }
-            // Take the data out, leaving an empty Vec. GStreamer takes ownership
-            // of the data buffer so we can't reuse it; however the next send()
-            // callback will grow the pending Vec in-place which is one allocation
-            // that gets amortized over time via Vec's growth strategy.
             std::mem::take(&mut *pending)
         };
         drop(state_guard);
@@ -343,6 +357,33 @@ impl EfpMux {
             outref.set_dts(buffer.dts());
         }
         self.srcpad.push(outbuf)
+    }
+
+    /// Handle upstream events arriving on the src pad (from downstream).
+    fn src_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
+        use gst::EventView;
+        match event.view() {
+            EventView::Qos(_) => {
+                // Swallow QoS events — the muxer has no meaningful way to
+                // translate them back to individual input streams, and
+                // forwarding them causes upstream sources to throttle/freeze.
+                true
+            }
+            EventView::CustomUpstream(e) => {
+                let s = e.structure().unwrap();
+                if s.name().as_str() == "GstForceKeyUnit" {
+                    // Forward force-key-unit to all sink pads so upstream
+                    // encoders can produce a keyframe (mirrors mpegtsmux).
+                    for sink_pad in self.sink_pad_snapshot() {
+                        sink_pad.push_event(event.clone());
+                    }
+                    true
+                } else {
+                    gst::Pad::event_default(pad, Some(&*self.obj()), event)
+                }
+            }
+            _ => gst::Pad::event_default(pad, Some(&*self.obj()), event),
+        }
     }
 
     fn sink_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
@@ -358,6 +399,12 @@ impl EfpMux {
                 true // don't forward — the mux produces its own caps
             }
             EventView::Segment(_) => true, // don't forward — mux has its own segment
+            EventView::FlushStart(_) => self.srcpad.push_event(gst::event::FlushStart::new()),
+            EventView::FlushStop(_e) => {
+                // Reset the EFP sender state by re-creating it.
+                let _ = self.start();
+                self.srcpad.push_event(gst::event::FlushStop::new(true))
+            }
             EventView::Eos(_) => {
                 let all_eos = {
                     let mut pads = self.pads.lock().unwrap();

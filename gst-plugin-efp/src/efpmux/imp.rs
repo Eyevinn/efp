@@ -25,7 +25,13 @@ impl Default for Settings {
 struct PadState {
     stream_id: u8,
     content_type: u8,
+    code: u32,
     eos: bool,
+}
+
+struct EmbedPadState {
+    stream_id: u8,
+    data_type: u8,
 }
 
 struct MuxState {
@@ -33,6 +39,13 @@ struct MuxState {
     /// Contiguous buffer of length-prefixed fragments: [4-byte BE len][data]...
     /// Avoids per-fragment heap allocation in the hot path.
     pending: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Pending embedded data waiting to be prepended to the next frame on the
+/// associated stream.
+struct PendingEmbed {
+    data: Vec<u8>,
+    data_type: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +89,9 @@ pub struct EfpMux {
     settings: Mutex<Settings>,
     state: Mutex<Option<MuxState>>,
     pads: Mutex<HashMap<gst::Pad, PadState>>,
+    embed_pads: Mutex<HashMap<gst::Pad, EmbedPadState>>,
+    /// Pending embedded data per stream ID, consumed by the next `sink_chain`.
+    pending_embeds: Mutex<HashMap<u8, Vec<PendingEmbed>>>,
     stream_ids: Mutex<StreamIdAllocator>,
     /// 0-based counter for pad naming (GStreamer convention: sink_0, sink_1, ...).
     /// Separate from EFP stream IDs which start at 1.
@@ -108,6 +124,8 @@ impl ObjectSubclass for EfpMux {
             settings: Mutex::new(Settings::default()),
             state: Mutex::new(None),
             pads: Mutex::new(HashMap::new()),
+            embed_pads: Mutex::new(HashMap::new()),
+            pending_embeds: Mutex::new(HashMap::new()),
             stream_ids: Mutex::new(StreamIdAllocator::new()),
             next_pad_index: Mutex::new(0),
             src_setup_done: AtomicBool::new(false),
@@ -193,7 +211,19 @@ impl ElementImpl for EfpMux {
             )
             .unwrap();
 
-            vec![src_template, sink_template]
+            let embed_caps = gst::Caps::builder("application/x-efp-embedded")
+                .field("data-type", gst::IntRange::new(0i32, 255i32))
+                .field("stream-id", gst::IntRange::new(0i32, 255i32))
+                .build();
+            let embed_template = gst::PadTemplate::new(
+                "embed_%u",
+                gst::PadDirection::Sink,
+                gst::PadPresence::Request,
+                &embed_caps,
+            )
+            .unwrap();
+
+            vec![src_template, sink_template, embed_template]
         });
         PAD_TEMPLATES.as_ref()
     }
@@ -202,8 +232,13 @@ impl ElementImpl for EfpMux {
         &self,
         templ: &gst::PadTemplate,
         name: Option<&str>,
-        _caps: Option<&gst::Caps>,
+        caps: Option<&gst::Caps>,
     ) -> Option<gst::Pad> {
+        let templ_name = templ.name_template();
+        if templ_name == "embed_%u" {
+            return self.request_embed_pad(templ, name, caps);
+        }
+
         let stream_id = self.stream_ids.lock().unwrap().allocate()?;
 
         let pad_name = name.map(String::from).unwrap_or_else(|| {
@@ -230,6 +265,7 @@ impl ElementImpl for EfpMux {
             PadState {
                 stream_id,
                 content_type: 0x01, // updated on caps event
+                code: 0,
                 eos: false,
             },
         );
@@ -243,6 +279,7 @@ impl ElementImpl for EfpMux {
         if let Some(ps) = self.pads.lock().unwrap().remove(pad) {
             self.stream_ids.lock().unwrap().release(ps.stream_id);
         }
+        self.embed_pads.lock().unwrap().remove(pad);
         let _ = self.obj().remove_pad(pad);
     }
 
@@ -326,13 +363,13 @@ impl EfpMux {
             None => return Err(gst::FlowError::NotNegotiated),
         };
 
-        let (stream_id, content_type) = {
+        let (stream_id, content_type, code) = {
             let pads = self.pads.lock().unwrap();
             let ps = match pads.get(pad) {
                 Some(ps) => ps,
                 None => return Err(gst::FlowError::Error),
             };
-            (ps.stream_id, ps.content_type)
+            (ps.stream_id, ps.content_type, ps.code)
         };
 
         // EFP reserves u64::MAX for PTS/DTS; use 0 when GStreamer has no timestamp.
@@ -340,9 +377,32 @@ impl EfpMux {
         let dts = buffer.dts().map_or(0, |t| t.nseconds());
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
-        if let Err(_e) = state
-            .sender
-            .send(map.as_slice(), content_type, pts, dts, 0, stream_id, 0)
+        // Prepend any pending embedded data for this stream.
+        let frame_data = {
+            let mut embeds = self.pending_embeds.lock().unwrap();
+            if let Some(pending) = embeds.remove(&stream_id) {
+                let mut combined = map.as_slice().to_vec();
+                for (i, emb) in pending.iter().enumerate() {
+                    let is_last = i == pending.len() - 1;
+                    combined = efp::add_embedded_data(&emb.data, &combined, emb.data_type, is_last)
+                        .map_err(|_| gst::FlowError::Error)?;
+                }
+                Some(combined)
+            } else {
+                None
+            }
+        };
+
+        let send_data = frame_data.as_deref().unwrap_or(map.as_slice());
+        let flags: u8 = if frame_data.is_some() {
+            efp::FLAG_INLINE_PAYLOAD
+        } else {
+            0
+        };
+        if let Err(_e) =
+            state
+                .sender
+                .send(send_data, content_type, pts, dts, code, stream_id, flags)
         {
             return Err(gst::FlowError::Error);
         }
@@ -399,8 +459,21 @@ impl EfpMux {
             EventView::Caps(e) => {
                 if let Some(s) = e.caps().structure(0) {
                     let ct = content_type_from_caps(s.name().as_str());
+                    let code = s
+                        .get::<&str>("efp-code")
+                        .ok()
+                        .and_then(|v| {
+                            let b = v.as_bytes();
+                            if b.len() == 4 {
+                                Some(efp::code(b[0], b[1], b[2], b[3]))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
                     if let Some(ps) = self.pads.lock().unwrap().get_mut(pad) {
                         ps.content_type = ct;
+                        ps.code = code;
                     }
                 }
                 true // don't forward — the mux produces its own caps
@@ -428,6 +501,96 @@ impl EfpMux {
             }
             _ => gst::Pad::event_default(pad, Some(&*self.obj()), event),
         }
+    }
+
+    fn request_embed_pad(
+        &self,
+        templ: &gst::PadTemplate,
+        name: Option<&str>,
+        caps: Option<&gst::Caps>,
+    ) -> Option<gst::Pad> {
+        // Extract stream-id and data-type from caps.
+        let (stream_id, data_type) = caps
+            .and_then(|c| c.structure(0))
+            .map(|s| {
+                let sid = s.get::<i32>("stream-id").unwrap_or(0) as u8;
+                let dt = s.get::<i32>("data-type").unwrap_or(0) as u8;
+                (sid, dt)
+            })
+            .unwrap_or((0, 0));
+
+        let pad_name = name
+            .map(String::from)
+            .unwrap_or_else(|| format!("embed_{stream_id}"));
+
+        let pad = gst::Pad::builder_from_template(templ)
+            .name(pad_name)
+            .chain_function(|pad, parent, buffer| {
+                let element = parent.unwrap().downcast_ref::<super::EfpMux>().unwrap();
+                element.imp().embed_chain(pad, buffer)
+            })
+            .event_function(|pad, parent, event| {
+                // Accept caps/segment, default for rest.
+                use gst::EventView;
+                match event.view() {
+                    EventView::Caps(e) => {
+                        // Update stream-id and data-type from renegotiated caps.
+                        if let Some(s) = e.caps().structure(0) {
+                            let element = parent.unwrap().downcast_ref::<super::EfpMux>().unwrap();
+                            let imp = element.imp();
+                            if let Some(eps) = imp.embed_pads.lock().unwrap().get_mut(pad) {
+                                eps.stream_id =
+                                    s.get::<i32>("stream-id").unwrap_or(eps.stream_id as i32) as u8;
+                                eps.data_type =
+                                    s.get::<i32>("data-type").unwrap_or(eps.data_type as i32) as u8;
+                            }
+                        }
+                        true
+                    }
+                    EventView::Segment(_) => true,
+                    EventView::Eos(_) => true, // embed EOS doesn't affect the main stream
+                    _ => gst::Pad::event_default(pad, parent, event),
+                }
+            })
+            .build();
+
+        self.embed_pads.lock().unwrap().insert(
+            pad.clone(),
+            EmbedPadState {
+                stream_id,
+                data_type,
+            },
+        );
+
+        self.obj().add_pad(&pad).ok()?;
+        pad.set_active(true).ok()?;
+        Some(pad)
+    }
+
+    fn embed_chain(
+        &self,
+        pad: &gst::Pad,
+        buffer: gst::Buffer,
+    ) -> Result<gst::FlowSuccess, gst::FlowError> {
+        let (stream_id, data_type) = {
+            let eps = self.embed_pads.lock().unwrap();
+            let state = eps.get(pad).ok_or(gst::FlowError::Error)?;
+            (state.stream_id, state.data_type)
+        };
+
+        let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+
+        self.pending_embeds
+            .lock()
+            .unwrap()
+            .entry(stream_id)
+            .or_default()
+            .push(PendingEmbed {
+                data: map.as_slice().to_vec(),
+                data_type,
+            });
+
+        Ok(gst::FlowSuccess::Ok)
     }
 }
 

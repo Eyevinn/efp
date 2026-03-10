@@ -230,3 +230,119 @@ fn add_embedded_data_produces_larger_buffer() {
         "combined buffer should include header overhead"
     );
 }
+
+#[test]
+fn embedded_data_roundtrip() {
+    let frame_payload = b"video-frame-data";
+    let embed_payload = b"metadata-payload";
+
+    let combined = efp::add_embedded_data(embed_payload, frame_payload, 42, true).unwrap();
+
+    let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let frag_cb = Arc::clone(&fragments);
+    let sender = efp::Sender::new(1400, move |fragment, _sid| {
+        frag_cb.lock().unwrap().push(fragment.to_vec());
+    })
+    .unwrap();
+    sender
+        .send(&combined, 0x01, 5000, 5000, 0, 1, efp::FLAG_INLINE_PAYLOAD)
+        .unwrap();
+
+    let frags = fragments.lock().unwrap().clone();
+
+    let frames = Arc::new(Mutex::new(Vec::<efp::SuperFrame>::new()));
+    let frames_cb = Arc::clone(&frames);
+    let embedded = Arc::new(Mutex::new(Vec::<efp::EmbeddedData>::new()));
+    let embedded_cb = Arc::clone(&embedded);
+
+    let receiver = efp::Receiver::with_embedded(
+        5,
+        5,
+        efp::ReceiverMode::RunToCompletion,
+        move |frame| {
+            frames_cb.lock().unwrap().push(frame);
+        },
+        Some(move |emb: efp::EmbeddedData| {
+            embedded_cb.lock().unwrap().push(emb);
+        }),
+    )
+    .unwrap();
+
+    for frag in &frags {
+        let _ = receiver.receive_fragment(frag, 0);
+    }
+
+    let f = frames.lock().unwrap();
+    let e = embedded.lock().unwrap();
+    assert_eq!(f.len(), 1, "should get one frame");
+    assert_eq!(
+        e.len(),
+        1,
+        "should get one embedded data (got {} frames, {} embedded)",
+        f.len(),
+        e.len()
+    );
+    assert_eq!(e[0].data, embed_payload);
+    assert_eq!(e[0].data_type, 42);
+}
+
+#[test]
+fn broken_frame_detection() {
+    // Fragment a large payload, drop one fragment, send the rest + a complete frame.
+    // The receiver should deliver the incomplete frame with broken=true.
+    let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let frag_cb = Arc::clone(&fragments);
+    let sender = Sender::new(1400, move |fragment, _sid| {
+        frag_cb.lock().unwrap().push(fragment.to_vec());
+    })
+    .unwrap();
+
+    let payload = vec![0xAB; 10_000];
+    sender.send(&payload, 0x01, 1000, 1000, 0, 1, 0).unwrap();
+
+    let frags = fragments.lock().unwrap().clone();
+    assert!(frags.len() > 2, "need multiple fragments");
+
+    // Send a second complete frame.
+    let fragments2 = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let frag_cb2 = Arc::clone(&fragments2);
+    let sender2 = Sender::new(1400, move |fragment, _sid| {
+        frag_cb2.lock().unwrap().push(fragment.to_vec());
+    })
+    .unwrap();
+    sender2
+        .send(&[0xCD; 500], 0x01, 2000, 2000, 0, 1, 0)
+        .unwrap();
+    let frags2 = fragments2.lock().unwrap().clone();
+
+    let received: Arc<Mutex<Vec<SuperFrame>>> = Arc::new(Mutex::new(Vec::new()));
+    let rx = Arc::clone(&received);
+    let receiver = Receiver::new(1, 1, ReceiverMode::Threaded, move |frame| {
+        rx.lock().unwrap().push(frame);
+    })
+    .unwrap();
+
+    // Feed incomplete frame (skip fragment 1).
+    for (i, frag) in frags.iter().enumerate() {
+        if i == 1 {
+            continue;
+        }
+        let _ = receiver.receive_fragment(frag, 0);
+    }
+
+    // Sleep to let timeout expire (1 * 10ms = 10ms timeout, wait 200ms).
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Feed complete frame.
+    for frag in &frags2 {
+        let _ = receiver.receive_fragment(frag, 0);
+    }
+
+    // Wait for threaded processing.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let frames = received.lock().unwrap();
+    assert!(!frames.is_empty(), "should get at least one frame");
+    let has_broken = frames.iter().any(|f| f.broken);
+    assert!(has_broken, "should have a broken frame");
+}

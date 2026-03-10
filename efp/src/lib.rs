@@ -156,6 +156,13 @@ pub const CONTENT_H265: u8 = 0x84;
 /// Opus audio.
 pub const CONTENT_OPUS: u8 = 0x89;
 
+// ---------------------------------------------------------------------------
+// Well-known flags for Sender::send
+// ---------------------------------------------------------------------------
+
+/// Flag: the frame contains inline embedded payload.
+pub const FLAG_INLINE_PAYLOAD: u8 = 0x10;
+
 /// Receiver operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverMode {

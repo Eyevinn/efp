@@ -77,6 +77,9 @@ pub struct EfpMux {
     state: Mutex<Option<MuxState>>,
     pads: Mutex<HashMap<gst::Pad, PadState>>,
     stream_ids: Mutex<StreamIdAllocator>,
+    /// 0-based counter for pad naming (GStreamer convention: sink_0, sink_1, ...).
+    /// Separate from EFP stream IDs which start at 1.
+    next_pad_index: Mutex<u32>,
     src_setup_done: AtomicBool,
 }
 
@@ -106,6 +109,7 @@ impl ObjectSubclass for EfpMux {
             state: Mutex::new(None),
             pads: Mutex::new(HashMap::new()),
             stream_ids: Mutex::new(StreamIdAllocator::new()),
+            next_pad_index: Mutex::new(0),
             src_setup_done: AtomicBool::new(false),
         }
     }
@@ -202,9 +206,12 @@ impl ElementImpl for EfpMux {
     ) -> Option<gst::Pad> {
         let stream_id = self.stream_ids.lock().unwrap().allocate()?;
 
-        let pad_name = name
-            .map(String::from)
-            .unwrap_or_else(|| format!("sink_{stream_id}"));
+        let pad_name = name.map(String::from).unwrap_or_else(|| {
+            let mut idx = self.next_pad_index.lock().unwrap();
+            let n = *idx;
+            *idx += 1;
+            format!("sink_{n}")
+        });
 
         let pad = gst::Pad::builder_from_template(templ)
             .name(pad_name)

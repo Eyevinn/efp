@@ -59,6 +59,9 @@ pub struct EfpDemux {
     state: Mutex<Option<DemuxState>>,
     srcpads: Mutex<HashMap<u8, gst::Pad>>,
     srcpad_state: Mutex<HashMap<u8, SrcPadState>>,
+    /// 0-based counter for pad naming (GStreamer convention: src_0, src_1, ...).
+    /// Separate from EFP stream IDs which start at 1.
+    next_pad_index: Mutex<u32>,
 }
 
 unsafe impl Send for EfpDemux {}
@@ -93,6 +96,7 @@ impl ObjectSubclass for EfpDemux {
             state: Mutex::new(None),
             srcpads: Mutex::new(HashMap::new()),
             srcpad_state: Mutex::new(HashMap::new()),
+            next_pad_index: Mutex::new(0),
         }
     }
 }
@@ -253,6 +257,7 @@ impl EfpDemux {
             let _ = self.obj().remove_pad(&pad);
         }
         self.srcpad_state.lock().unwrap().clear();
+        *self.next_pad_index.lock().unwrap() = 0;
     }
 
     /// Reset the EFP receiver and adapter to discard stale in-flight data.
@@ -418,7 +423,12 @@ impl EfpDemux {
         }
         // Slow path: create pad without holding srcpads lock to avoid
         // deadlocks when downstream events re-enter this element.
-        let pad_name = format!("src_{stream_id}");
+        let pad_name = {
+            let mut idx = self.next_pad_index.lock().unwrap();
+            let n = *idx;
+            *idx += 1;
+            format!("src_{n}")
+        };
         let templ = self.obj().pad_template("src_%u").unwrap();
         let pad = gst::Pad::builder_from_template(&templ)
             .name(&pad_name)

@@ -288,6 +288,7 @@ impl Sender {
     /// * `mtu` – Maximum transmission unit (fragment size) in bytes.
     /// * `on_fragment` – Called for every fragment produced.  Receives the
     ///   fragment bytes and the stream ID.
+    ///
     /// Minimum MTU required by the EFP protocol (must fit at least the header).
     pub const MIN_MTU: u64 = 256;
     /// Maximum MTU (C++ internally stores as `uint32_t`).
@@ -297,7 +298,7 @@ impl Sender {
     where
         F: Fn(&[u8], u8) + Send + Sync + 'static,
     {
-        if mtu < Self::MIN_MTU || mtu > Self::MAX_MTU {
+        if !(Self::MIN_MTU..=Self::MAX_MTU).contains(&mtu) {
             return Err(EfpError::FrameSizeMismatch);
         }
         let ctx = Box::new(SenderCtx {

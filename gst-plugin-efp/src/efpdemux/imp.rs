@@ -280,12 +280,8 @@ impl EfpDemux {
         let buf = &state.adapter;
         let mut pos = state.adapter_offset;
         while buf.len() - pos >= 4 {
-            let len = u32::from_be_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]) as usize;
+            let len =
+                u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
 
             if len == 0 || len > MAX_FRAGMENT_SIZE {
                 // Fragment length exceeds MAX_FRAGMENT_SIZE — likely corrupt.
@@ -427,6 +423,8 @@ fn caps_for_content_type(ct: u8) -> gst::Caps {
             .field("alignment", "au")
             .build(),
         efp::CONTENT_OPUS => gst::Caps::builder("audio/x-opus").build(),
-        _ => gst::Caps::new_any(),
+        _ => gst::Caps::builder("application/x-efp-private")
+            .field("content-type", ct as i32)
+            .build(),
     }
 }

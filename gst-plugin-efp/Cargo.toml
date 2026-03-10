@@ -11,8 +11,12 @@ efp = { path = "../efp" }
 glib = "0.22"
 gst = { package = "gstreamer", version = "0.25" }
 
+[dev-dependencies]
+gst-app = { package = "gstreamer-app", version = "0.25" }
+
 [build-dependencies]
 gst-plugin-version-helper = "0.8"
 
 [lib]
+name = "gstefp"
 crate-type = ["cdylib", "rlib"]

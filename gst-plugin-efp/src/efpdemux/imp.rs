@@ -483,9 +483,8 @@ impl EfpDemux {
             .name("embedded")
             .build();
 
-        self.obj()
-            .add_pad(&pad)
-            .map_err(|_| gst::FlowError::Error)?;
+        // Activate pad and push sticky events BEFORE add_pad so that
+        // pad-added signal handlers can query caps to determine media type.
         pad.set_active(true).map_err(|_| gst::FlowError::Error)?;
 
         let sid = format!("{:08x}-embedded", self.obj().as_ptr() as usize);
@@ -498,6 +497,10 @@ impl EfpDemux {
 
         let segment = gst::FormattedSegment::<gst::ClockTime>::new();
         pad.push_event(gst::event::Segment::new(&segment));
+
+        self.obj()
+            .add_pad(&pad)
+            .map_err(|_| gst::FlowError::Error)?;
 
         *self.embedded_pad.lock().unwrap() = Some(pad.clone());
         Ok(pad)
@@ -529,14 +532,11 @@ impl EfpDemux {
             .name(&pad_name)
             .build();
 
-        // Add pad to element first, then activate and push initial events.
-        self.obj()
-            .add_pad(&pad)
-            .map_err(|_| gst::FlowError::Error)?;
-
+        // Activate pad and push sticky events BEFORE add_pad so that
+        // pad-added signal handlers can query caps to determine media type.
+        // This matches the pattern used by tsdemux and other GStreamer demuxers.
         pad.set_active(true).map_err(|_| gst::FlowError::Error)?;
 
-        // Send mandatory initial events before any buffers.
         let sid = format!("{:08x}-{stream_id}", self.obj().as_ptr() as usize);
         pad.push_event(gst::event::StreamStart::new(&sid));
 
@@ -545,6 +545,10 @@ impl EfpDemux {
 
         let segment = gst::FormattedSegment::<gst::ClockTime>::new();
         pad.push_event(gst::event::Segment::new(&segment));
+
+        self.obj()
+            .add_pad(&pad)
+            .map_err(|_| gst::FlowError::Error)?;
 
         // Track per-pad state: mark first buffer as DISCONT and wait for
         // keyframe on video streams (like tsdemux does).
@@ -718,7 +722,10 @@ fn caps_for_content_type(ct: u8, code: u32) -> gst::Caps {
         efp::CONTENT_H265 => gst::Caps::builder("video/x-h265")
             .field("stream-format", "byte-stream")
             .field("alignment", "au"),
-        efp::CONTENT_OPUS => gst::Caps::builder("audio/x-opus"),
+        efp::CONTENT_OPUS => gst::Caps::builder("audio/x-opus")
+            .field("rate", 48000i32)
+            .field("channels", 2i32)
+            .field("channel-mapping-family", 0i32),
         _ => gst::Caps::builder("application/x-efp-private").field("content-type", ct as i32),
     };
     if code != 0 {

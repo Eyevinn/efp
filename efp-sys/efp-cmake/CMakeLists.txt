@@ -15,6 +15,10 @@ target_include_directories(efp PUBLIC
     ${EFP_SOURCE_DIR}/efp_c_api
 )
 
+# GCC 15+ no longer implicitly includes <algorithm> via other headers.
+# The vendored EFP source uses std::copy_n without including it directly.
+target_compile_options(efp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include algorithm>)
+
 find_package(Threads REQUIRED)
 target_link_libraries(efp Threads::Threads)
 

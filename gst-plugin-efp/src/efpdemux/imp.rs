@@ -48,8 +48,6 @@ struct DemuxState {
 struct SrcPadState {
     /// True until the first buffer has been pushed on this pad.
     needs_discont: bool,
-    /// True until we have seen a keyframe (only relevant for H.264/H.265).
-    waiting_for_keyframe: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,10 +298,45 @@ impl EfpDemux {
     /// Reset the EFP receiver and adapter to discard stale in-flight data.
     /// Called on flush and discontinuity.
     fn reset_receiver(&self) -> std::result::Result<(), gst::FlowError> {
-        // Re-create the receiver to flush its internal buckets. This is the
-        // only reliable way since the C API has no "flush" method.
-        self.stop();
-        self.start().map_err(|_| gst::FlowError::Error)?;
+        let settings = self.settings.lock().unwrap();
+        let pending = Arc::new(Mutex::new(Vec::<efp::SuperFrame>::new()));
+        let pending_cb = Arc::clone(&pending);
+        let pending_embedded = Arc::new(Mutex::new(Vec::<efp::EmbeddedData>::new()));
+        let pending_embedded_cb = Arc::clone(&pending_embedded);
+
+        let receiver = efp::Receiver::with_embedded(
+            settings.bucket_timeout,
+            settings.hol_timeout,
+            if settings.threaded {
+                efp::ReceiverMode::Threaded
+            } else {
+                efp::ReceiverMode::RunToCompletion
+            },
+            move |frame| {
+                pending_cb.lock().unwrap().push(frame);
+            },
+            Some(move |embedded| {
+                pending_embedded_cb.lock().unwrap().push(embedded);
+            }),
+        )
+        .map_err(|_| gst::FlowError::Error)?;
+
+        let mut state_guard = self.state.lock().unwrap();
+        if let Some(state) = state_guard.as_mut() {
+            state.receiver = receiver;
+            state.pending = pending;
+            state.pending_embedded = pending_embedded;
+            state.adapter.clear();
+            state.adapter_offset = 0;
+        } else {
+            *state_guard = Some(DemuxState {
+                receiver,
+                pending,
+                pending_embedded,
+                adapter: Vec::new(),
+                adapter_offset: 0,
+            });
+        }
         Ok(())
     }
 
@@ -369,7 +402,15 @@ impl EfpDemux {
         drop(state_guard);
 
         for frame in frames {
-            self.push_frame(frame)?;
+            match self.push_frame(frame) {
+                Ok(_) => {}
+                // NOT_NEGOTIATED can happen when downstream decode chains are
+                // still doing async state changes after dynamic pad creation.
+                // Drop the frame and continue — subsequent frames will succeed
+                // once the chain is ready.
+                Err(gst::FlowError::NotNegotiated | gst::FlowError::NotLinked) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         for emb in embedded {
@@ -384,28 +425,16 @@ impl EfpDemux {
     fn push_frame(&self, frame: efp::SuperFrame) -> Result<gst::FlowSuccess, gst::FlowError> {
         let srcpad = self.get_or_create_srcpad(frame.stream_id, frame.data_content, frame.code)?;
 
-        // Check if we should skip this frame (waiting for keyframe).
-        let (needs_discont, should_skip) = {
+        let needs_discont = {
             let mut states = self.srcpad_state.lock().unwrap();
             if let Some(ps) = states.get_mut(&frame.stream_id) {
-                if ps.waiting_for_keyframe {
-                    if !is_keyframe(&frame) {
-                        // Drop non-keyframe data until we see a keyframe.
-                        return Ok(gst::FlowSuccess::Ok);
-                    }
-                    ps.waiting_for_keyframe = false;
-                }
                 let discont = ps.needs_discont;
                 ps.needs_discont = false;
-                (discont, false)
+                discont
             } else {
-                (false, false)
+                false
             }
         };
-
-        if should_skip {
-            return Ok(gst::FlowSuccess::Ok);
-        }
 
         // Update segment start when we see the first PTS for this pad, so that
         // downstream running-time starts near 0 instead of using the raw PTS
@@ -550,18 +579,15 @@ impl EfpDemux {
             .add_pad(&pad)
             .map_err(|_| gst::FlowError::Error)?;
 
-        // Track per-pad state: mark first buffer as DISCONT and wait for
-        // keyframe on video streams (like tsdemux does).
-        let wait_keyframe = content_type == efp::CONTENT_H264 || content_type == efp::CONTENT_H265;
         self.srcpad_state.lock().unwrap().insert(
             stream_id,
             SrcPadState {
                 needs_discont: true,
-                waiting_for_keyframe: wait_keyframe,
             },
         );
 
         self.srcpads.lock().unwrap().insert(stream_id, pad.clone());
+
         Ok(pad)
     }
 
@@ -643,75 +669,6 @@ impl EfpDemux {
             _ => gst::Pad::query_default(pad, Some(&*self.obj()), query),
         }
     }
-}
-
-/// Check if an EFP SuperFrame contains a keyframe.
-/// For H.264/H.265 byte-stream, scan NAL units for IDR/CRA/BLA types.
-fn is_keyframe(frame: &efp::SuperFrame) -> bool {
-    match frame.data_content {
-        efp::CONTENT_H264 => h264_has_idr(&frame.data),
-        efp::CONTENT_H265 => h265_has_idr(&frame.data),
-        // Non-video content types are always "keyframes" (no dependency chain).
-        _ => true,
-    }
-}
-
-/// Scan H.264 byte-stream for IDR NAL units (type 5).
-fn h264_has_idr(data: &[u8]) -> bool {
-    for_each_nal(data, |nal| {
-        let nal_type = nal[0] & 0x1F;
-        nal_type == 5 // IDR slice
-    })
-}
-
-/// Scan H.265 byte-stream for IDR/CRA/BLA NAL units.
-fn h265_has_idr(data: &[u8]) -> bool {
-    for_each_nal(data, |nal| {
-        if nal.len() < 2 {
-            return false;
-        }
-        let nal_type = (nal[0] >> 1) & 0x3F;
-        // IDR_W_RADL(19), IDR_N_LP(20), CRA(21), BLA_W_LP(16), BLA_W_RADL(17), BLA_N_LP(18)
-        (16..=21).contains(&nal_type)
-    })
-}
-
-/// Iterate over NAL units in Annex B byte-stream format, calling `pred` for
-/// each NAL body. Returns true if `pred` returns true for any NAL.
-fn for_each_nal(data: &[u8], mut pred: impl FnMut(&[u8]) -> bool) -> bool {
-    let mut i = 0;
-    let len = data.len();
-    while i < len {
-        // Find start code: 00 00 01 or 00 00 00 01
-        if i + 2 < len && data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1 {
-                i += 3;
-            } else if i + 3 < len && data[i + 2] == 0 && data[i + 3] == 1 {
-                i += 4;
-            } else {
-                i += 1;
-                continue;
-            }
-            // i now points to NAL body; find end
-            let start = i;
-            while i < len {
-                if i + 2 < len
-                    && data[i] == 0
-                    && data[i + 1] == 0
-                    && (data[i + 2] == 1 || (i + 3 < len && data[i + 2] == 0 && data[i + 3] == 1))
-                {
-                    break;
-                }
-                i += 1;
-            }
-            if start < len && pred(&data[start..i]) {
-                return true;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    false
 }
 
 fn caps_for_content_type(ct: u8, code: u32) -> gst::Caps {

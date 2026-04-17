@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use gst::prelude::*;
+use gstefp::efpdemux::NormalizeSegment;
 
 fn init() {
     use std::sync::Once;
@@ -444,4 +445,276 @@ fn embedded_data_output() {
         "should have received embedded data on the embedded pad"
     );
     assert_eq!(bufs[0], embed_payload, "embedded data content should match");
+}
+
+#[test]
+fn normalize_segment_property_roundtrip() {
+    init();
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+
+    let value: NormalizeSegment = demux.property("normalize-segment");
+    assert_eq!(value, NormalizeSegment::Auto, "default should be Auto");
+
+    demux.set_property_from_str("normalize-segment", "never");
+    let value: NormalizeSegment = demux.property("normalize-segment");
+    assert_eq!(value, NormalizeSegment::Never);
+
+    demux.set_property_from_str("normalize-segment", "always");
+    let value: NormalizeSegment = demux.property("normalize-segment");
+    assert_eq!(value, NormalizeSegment::Always);
+}
+
+/// Run a frame with a large PTS through the demux with a given
+/// normalize-segment setting, and return the sticky segment's `start` value
+/// observed on the outgoing src pad after the frame has been pushed.
+///
+/// If `clock_type` is `Some`, a dedicated `GstSystemClock` instance with that
+/// type is used as the pipeline clock (does not touch the global singleton).
+fn observed_segment_start(mode: &str, clock_type: Option<gst::ClockType>) -> gst::ClockTime {
+    init();
+
+    // 20 seconds in nanoseconds — large enough to trigger the Always path.
+    let pts = 20 * gst::ClockTime::SECOND.nseconds();
+    let data = efp_encode(b"payload", 0x01, pts, 1, 0);
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = gst::ElementFactory::make("appsrc").build().unwrap();
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+    let fakesink = gst::ElementFactory::make("fakesink")
+        .property("async", false)
+        .property("sync", false)
+        .build()
+        .unwrap();
+
+    demux.set_property_from_str("normalize-segment", mode);
+
+    if let Some(ct) = clock_type {
+        let clock: gst::SystemClock = glib::Object::builder()
+            .property("clock-type", ct)
+            .build();
+        pipeline.use_clock(Some(&clock));
+    }
+
+    pipeline.add_many([&appsrc, &demux, &fakesink]).unwrap();
+    appsrc.link(&demux).unwrap();
+
+    let observed = Arc::new(Mutex::new(None::<gst::ClockTime>));
+    let observed_cb = Arc::clone(&observed);
+    let fakesink_weak = fakesink.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        if !pad.name().starts_with("src_") {
+            return;
+        }
+        let obs = Arc::clone(&observed_cb);
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(gst::PadProbeData::Event(ref event)) = info.data {
+                if let gst::EventView::Segment(seg) = event.view() {
+                    if let Ok(s) = seg.segment().clone().downcast::<gst::ClockTime>() {
+                        *obs.lock().unwrap() = s.start();
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        if let Some(sink) = fakesink_weak.upgrade() {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            if !sinkpad.is_linked() {
+                pad.link(&sinkpad).unwrap();
+            }
+        }
+    });
+
+    let src_caps = gst::Caps::builder("application/x-efp").build();
+    appsrc.set_property("caps", &src_caps);
+    appsrc.set_property("format", gst::Format::Bytes);
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    let src = appsrc.clone().dynamic_cast::<gst_app::AppSrc>().unwrap();
+    let buf = gst::Buffer::from_slice(data);
+    src.push_buffer(buf).unwrap();
+    src.end_of_stream().unwrap();
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let result = observed.lock().unwrap().unwrap_or(gst::ClockTime::ZERO);
+    result
+}
+
+#[test]
+fn normalize_segment_always_rewrites_segment_start() {
+    let start = observed_segment_start("always", None);
+    let expected = gst::ClockTime::from_seconds(20);
+    assert_eq!(
+        start, expected,
+        "with normalize-segment=always, segment.start should be updated to PTS"
+    );
+}
+
+#[test]
+fn normalize_segment_never_preserves_zero_start() {
+    let start = observed_segment_start("never", None);
+    assert_eq!(
+        start,
+        gst::ClockTime::ZERO,
+        "with normalize-segment=never, segment.start should remain at 0"
+    );
+}
+
+#[test]
+fn normalize_segment_auto_monotonic_clock_rewrites() {
+    // Monotonic clock signals "no interest in absolute time" → normalize.
+    let start = observed_segment_start("auto", Some(gst::ClockType::Monotonic));
+    assert_eq!(
+        start,
+        gst::ClockTime::from_seconds(20),
+        "Auto + monotonic clock should rewrite segment.start to PTS"
+    );
+}
+
+#[test]
+fn normalize_segment_auto_realtime_clock_passthrough() {
+    // Realtime clock signals "absolute time matters" → passthrough.
+    let start = observed_segment_start("auto", Some(gst::ClockType::Realtime));
+    assert_eq!(
+        start,
+        gst::ClockTime::ZERO,
+        "Auto + realtime clock should leave segment.start at 0 (passthrough)"
+    );
+}
+
+/// End-to-end sync contract: buffers pushed through efpmux → efpdemux with
+/// `normalize-segment=never` must retain their absolute PTS on the output
+/// side, and the outgoing segment.start must remain 0 so that downstream
+/// running-time equals absolute PTS. This is the foundation that lets a
+/// consumer line up two independent demux outputs by running-time.
+#[test]
+fn pts_preservation_roundtrip_with_normalize_never() {
+    init();
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = gst::ElementFactory::make("appsrc")
+        .property("format", gst::Format::Time)
+        .property("is-live", false)
+        .build()
+        .unwrap();
+    let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+    demux.set_property_from_str("normalize-segment", "never");
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("async", false)
+        .property("sync", false)
+        .build()
+        .unwrap();
+
+    let caps = gst::Caps::builder("application/x-efp-private")
+        .field("content-type", 0x20i32)
+        .build();
+    appsrc.set_property("caps", &caps);
+
+    pipeline
+        .add_many([&appsrc, &mux, &demux, &appsink])
+        .unwrap();
+    appsrc.link(&mux).unwrap();
+    mux.link(&demux).unwrap();
+
+    // Capture buffer PTS on the appsink side.
+    let appsink_cast = appsink.clone().dynamic_cast::<gst_app::AppSink>().unwrap();
+    let received = Arc::new(Mutex::new(Vec::<gst::ClockTime>::new()));
+    let received_cb = Arc::clone(&received);
+    appsink_cast.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                let buffer = sample.buffer().unwrap();
+                if let Some(pts) = buffer.pts() {
+                    received_cb.lock().unwrap().push(pts);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    // Capture sticky segment on the demuxer's src pad.
+    let segment_start = Arc::new(Mutex::new(None::<gst::ClockTime>));
+    let segment_start_cb = Arc::clone(&segment_start);
+    let appsink_weak = appsink.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        if !pad.name().starts_with("src_") {
+            return;
+        }
+        let seg = Arc::clone(&segment_start_cb);
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(gst::PadProbeData::Event(ref event)) = info.data {
+                if let gst::EventView::Segment(ev) = event.view() {
+                    if let Ok(s) = ev.segment().clone().downcast::<gst::ClockTime>() {
+                        *seg.lock().unwrap() = s.start();
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        if let Some(sink) = appsink_weak.upgrade() {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            if !sinkpad.is_linked() {
+                pad.link(&sinkpad).unwrap();
+            }
+        }
+    });
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    // Push three buffers with large absolute PTS (simulating a wallclock-
+    // stamped sender). 20.000s, 20.040s, 20.080s (40 ms apart).
+    let base_pts = gst::ClockTime::from_seconds(20);
+    let step = gst::ClockTime::from_mseconds(40);
+    let pushed: Vec<gst::ClockTime> = (0..3).map(|i| base_pts + step * (i as u64)).collect();
+
+    let src = appsrc.clone().dynamic_cast::<gst_app::AppSrc>().unwrap();
+    for pts in &pushed {
+        let mut buf = gst::Buffer::from_slice(b"payload".to_vec());
+        buf.get_mut().unwrap().set_pts(*pts);
+        buf.get_mut().unwrap().set_dts(*pts);
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let rx = received.lock().unwrap().clone();
+    assert_eq!(
+        rx, pushed,
+        "output PTS must equal input PTS when normalize-segment=never"
+    );
+
+    let seg_start = segment_start.lock().unwrap().unwrap_or(gst::ClockTime::ZERO);
+    assert_eq!(
+        seg_start,
+        gst::ClockTime::ZERO,
+        "outgoing segment.start must remain 0 so running-time == absolute PTS"
+    );
 }

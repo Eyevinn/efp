@@ -8,6 +8,30 @@ use gst::subclass::prelude::*;
 const DEFAULT_BUCKET_TIMEOUT: u32 = 5;
 const DEFAULT_HOL_TIMEOUT: u32 = 5;
 
+/// Controls whether the demuxer rewrites the outgoing segment start so that
+/// running-time begins near 0 on each pad, even when the incoming PTS carries
+/// a large absolute offset from the sender.
+///
+/// - `Auto`: decide based on the pipeline clock. A monotonic system clock (or
+///   no clock) means the user has not signalled interest in absolute time, so
+///   the segment is normalized. A realtime/TAI system clock or a network clock
+///   (NTP/PTP/net-client) means running-time should carry absolute pipeline
+///   time so downstream blocks can synchronize across demux instances.
+/// - `Always`: normalize unconditionally (pre-existing behaviour).
+/// - `Never`: never rewrite the segment. Running-time equals absolute PTS.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Default, glib::Enum)]
+#[enum_type(name = "GstEfpNormalizeSegment")]
+#[repr(i32)]
+pub enum NormalizeSegment {
+    #[enum_value(name = "Auto based on pipeline clock type", nick = "auto")]
+    #[default]
+    Auto = 0,
+    #[enum_value(name = "Always normalize segment start", nick = "always")]
+    Always = 1,
+    #[enum_value(name = "Never normalize segment start", nick = "never")]
+    Never = 2,
+}
+
 /// Maximum adapter buffer size (16 MiB). Reject input beyond this to prevent
 /// unbounded memory growth from malformed length-prefixed streams.
 const MAX_ADAPTER_SIZE: usize = 16 * 1024 * 1024;
@@ -23,6 +47,7 @@ struct Settings {
     bucket_timeout: u32,
     hol_timeout: u32,
     threaded: bool,
+    normalize_segment: NormalizeSegment,
 }
 
 impl Default for Settings {
@@ -31,6 +56,7 @@ impl Default for Settings {
             bucket_timeout: DEFAULT_BUCKET_TIMEOUT,
             hol_timeout: DEFAULT_HOL_TIMEOUT,
             threaded: false,
+            normalize_segment: NormalizeSegment::default(),
         }
     }
 }
@@ -134,6 +160,16 @@ impl ObjectImpl for EfpDemux {
                     .default_value(false)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecEnum::builder::<NormalizeSegment>("normalize-segment")
+                    .nick("Normalize Segment")
+                    .blurb(
+                        "Whether to rewrite segment start so running-time begins near 0. \
+                         Auto picks based on the pipeline clock: monotonic => normalize, \
+                         realtime/TAI/NTP/PTP => pass absolute PTS through.",
+                    )
+                    .default_value(NormalizeSegment::default())
+                    .mutable_ready()
+                    .build(),
             ]
         });
         PROPERTIES.as_ref()
@@ -144,6 +180,9 @@ impl ObjectImpl for EfpDemux {
             "bucket-timeout" => self.settings.lock().unwrap().bucket_timeout = value.get().unwrap(),
             "hol-timeout" => self.settings.lock().unwrap().hol_timeout = value.get().unwrap(),
             "threaded" => self.settings.lock().unwrap().threaded = value.get().unwrap(),
+            "normalize-segment" => {
+                self.settings.lock().unwrap().normalize_segment = value.get().unwrap()
+            }
             _ => unimplemented!(),
         }
     }
@@ -154,6 +193,7 @@ impl ObjectImpl for EfpDemux {
             "bucket-timeout" => s.bucket_timeout.to_value(),
             "hol-timeout" => s.hol_timeout.to_value(),
             "threaded" => s.threaded.to_value(),
+            "normalize-segment" => s.normalize_segment.to_value(),
             _ => unimplemented!(),
         }
     }
@@ -422,6 +462,36 @@ impl EfpDemux {
         Ok(gst::FlowSuccess::Ok)
     }
 
+    /// Decide whether to rewrite segment start on the outgoing pads.
+    ///
+    /// `Always` / `Never` are honored directly. In `Auto` mode the pipeline
+    /// clock tells us whether the user cares about absolute time:
+    /// - No clock assigned yet → normalize (safe default, matches legacy)
+    /// - GstPtpClock / GstNtpClock / GstNetClientClock → absolute time, passthrough
+    /// - GstSystemClock with clock-type=Monotonic → passthrough disabled, normalize
+    /// - GstSystemClock with clock-type=Realtime/TAI → absolute time, passthrough
+    /// - Any other clock subclass → normalize (legacy-safe default)
+    fn should_normalize_segment(&self) -> bool {
+        let mode = self.settings.lock().unwrap().normalize_segment;
+        match mode {
+            NormalizeSegment::Always => true,
+            NormalizeSegment::Never => false,
+            NormalizeSegment::Auto => {
+                let Some(clock) = self.obj().clock() else {
+                    return true;
+                };
+                match clock.type_().name() {
+                    "GstPtpClock" | "GstNtpClock" | "GstNetClientClock" => false,
+                    "GstSystemClock" => matches!(
+                        clock.property::<gst::ClockType>("clock-type"),
+                        gst::ClockType::Monotonic
+                    ),
+                    _ => true,
+                }
+            }
+        }
+    }
+
     fn push_frame(&self, frame: efp::SuperFrame) -> Result<gst::FlowSuccess, gst::FlowError> {
         let srcpad = self.get_or_create_srcpad(frame.stream_id, frame.data_content, frame.code)?;
 
@@ -439,6 +509,14 @@ impl EfpDemux {
         // Update segment start when we see the first PTS for this pad, so that
         // downstream running-time starts near 0 instead of using the raw PTS
         // (which may carry a large offset from the sender). Mirrors tsdemux.
+        //
+        // Cross-source synchronization requires absolute PTS to survive as
+        // running-time, so this behaviour is controlled by the
+        // `normalize-segment` property (see `NormalizeSegment`).
+        //
+        // The cheap `need_update` check is evaluated first; the settings /
+        // pipeline-clock inspection in `should_normalize_segment` only runs
+        // when a rewrite is actually pending (once per pad in practice).
         if frame.pts != u64::MAX {
             let pts = gst::ClockTime::from_nseconds(frame.pts);
             let need_update = {
@@ -457,7 +535,7 @@ impl EfpDemux {
                     None => false,
                 }
             };
-            if need_update {
+            if need_update && self.should_normalize_segment() {
                 let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
                 segment.set_start(pts);
                 segment.set_position(pts);

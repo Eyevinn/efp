@@ -3,6 +3,8 @@ use gst::prelude::*;
 
 mod imp;
 
+pub use imp::NormalizeSegment;
+
 glib::wrapper! {
     pub struct EfpDemux(ObjectSubclass<imp::EfpDemux>) @extends gst::Element, gst::Object;
 }

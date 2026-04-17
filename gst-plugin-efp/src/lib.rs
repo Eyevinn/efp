@@ -1,6 +1,6 @@
 use gst::glib;
 
-mod efpdemux;
+pub mod efpdemux;
 mod efpmux;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {

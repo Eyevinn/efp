@@ -1,6 +1,6 @@
 [package]
 name = "gst-plugin-efp"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "GStreamer plugin for EFP muxing and demuxing"
 license = "MIT"

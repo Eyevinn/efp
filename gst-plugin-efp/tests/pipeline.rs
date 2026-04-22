@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use gst::prelude::*;
 use gstefp::efpdemux::NormalizeSegment;
+use gstefp::efpmux::TimestampMode;
 
 fn init() {
     use std::sync::Once;
@@ -489,9 +490,7 @@ fn observed_segment_start(mode: &str, clock_type: Option<gst::ClockType>) -> gst
     demux.set_property_from_str("normalize-segment", mode);
 
     if let Some(ct) = clock_type {
-        let clock: gst::SystemClock = glib::Object::builder()
-            .property("clock-type", ct)
-            .build();
+        let clock: gst::SystemClock = glib::Object::builder().property("clock-type", ct).build();
         pipeline.use_clock(Some(&clock));
     }
 
@@ -585,13 +584,18 @@ fn normalize_segment_auto_monotonic_clock_rewrites() {
 }
 
 #[test]
-fn normalize_segment_auto_realtime_clock_passthrough() {
-    // Realtime clock signals "absolute time matters" → passthrough.
+fn normalize_segment_auto_realtime_clock_leaves_segment_default() {
+    // Realtime clock resolves Auto to RebaseToRunningTime. The rebase path
+    // leaves the outgoing segment at its default (start=0) because buffer
+    // PTS is small after the base_time subtraction — the Always-style
+    // segment rewrite is not needed. See
+    // `normalize_segment_auto_realtime_rebases_to_small_pts` for the PTS
+    // side of the same contract.
     let start = observed_segment_start("auto", Some(gst::ClockType::Realtime));
     assert_eq!(
         start,
         gst::ClockTime::ZERO,
-        "Auto + realtime clock should leave segment.start at 0 (passthrough)"
+        "Auto + realtime clock resolves to RebaseToRunningTime; segment.start stays at 0"
     );
 }
 
@@ -611,6 +615,10 @@ fn pts_preservation_roundtrip_with_normalize_never() {
         .build()
         .unwrap();
     let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+    // Explicitly pick passthrough on the mux side so the test validates the
+    // "PTS survives the round-trip unchanged" contract. The new default
+    // (absolute-from-running-time) would add base_time, breaking equality.
+    mux.set_property_from_str("timestamp-mode", "buffer");
     let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
     demux.set_property_from_str("normalize-segment", "never");
     let appsink = gst::ElementFactory::make("appsink")
@@ -711,10 +719,355 @@ fn pts_preservation_roundtrip_with_normalize_never() {
         "output PTS must equal input PTS when normalize-segment=never"
     );
 
-    let seg_start = segment_start.lock().unwrap().unwrap_or(gst::ClockTime::ZERO);
+    let seg_start = segment_start
+        .lock()
+        .unwrap()
+        .unwrap_or(gst::ClockTime::ZERO);
     assert_eq!(
         seg_start,
         gst::ClockTime::ZERO,
         "outgoing segment.start must remain 0 so running-time == absolute PTS"
+    );
+}
+
+#[test]
+fn timestamp_mode_property_roundtrip() {
+    init();
+    let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+
+    let value: TimestampMode = mux.property("timestamp-mode");
+    assert_eq!(
+        value,
+        TimestampMode::AbsoluteFromRunningTime,
+        "default should be AbsoluteFromRunningTime"
+    );
+
+    mux.set_property_from_str("timestamp-mode", "buffer");
+    let value: TimestampMode = mux.property("timestamp-mode");
+    assert_eq!(value, TimestampMode::Buffer);
+
+    mux.set_property_from_str("timestamp-mode", "absolute-from-running-time");
+    let value: TimestampMode = mux.property("timestamp-mode");
+    assert_eq!(value, TimestampMode::AbsoluteFromRunningTime);
+}
+
+/// Mux in `absolute-from-running-time` mode must add the pipeline's base_time
+/// to the PTS embedded in the EFP wire frame, so receivers that share the
+/// same clock domain can reconstruct absolute sender timing.
+///
+/// The on-wire EFP-encoded PTS lives inside the payload bytes — the
+/// GStreamer buffer PTS on mux.src is set from the input buffer and does
+/// not reflect the rewrite. To read the wire PTS back cheaply we chain a
+/// `demux normalize-segment=never` which decodes the EFP frame and sets
+/// `buffer.pts` directly to the wire PTS without any rebasing.
+#[test]
+fn mux_abs_mode_writes_absolute_wire_pts() {
+    init();
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = gst::ElementFactory::make("appsrc")
+        .property("format", gst::Format::Time)
+        .property("is-live", false)
+        .build()
+        .unwrap();
+    let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+    mux.set_property_from_str("timestamp-mode", "absolute-from-running-time");
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+    demux.set_property_from_str("normalize-segment", "never");
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("async", false)
+        .property("sync", false)
+        .build()
+        .unwrap();
+
+    let caps = gst::Caps::builder("application/x-efp-private")
+        .field("content-type", 0x20i32)
+        .build();
+    appsrc.set_property("caps", &caps);
+
+    pipeline
+        .add_many([&appsrc, &mux, &demux, &appsink])
+        .unwrap();
+    appsrc.link(&mux).unwrap();
+    mux.link(&demux).unwrap();
+
+    let appsink_cast = appsink.clone().dynamic_cast::<gst_app::AppSink>().unwrap();
+    let received = Arc::new(Mutex::new(Vec::<gst::ClockTime>::new()));
+    let received_cb = Arc::clone(&received);
+    appsink_cast.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                if let Some(pts) = sample.buffer().and_then(|b| b.pts()) {
+                    received_cb.lock().unwrap().push(pts);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let appsink_weak = appsink.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        if !pad.name().starts_with("src_") {
+            return;
+        }
+        if let Some(sink) = appsink_weak.upgrade() {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            if !sinkpad.is_linked() {
+                pad.link(&sinkpad).unwrap();
+            }
+        }
+    });
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let base_time = pipeline.base_time().expect("pipeline base_time after Playing");
+
+    let input_pts: Vec<gst::ClockTime> = (0..3)
+        .map(|i| gst::ClockTime::from_mseconds(40 * i as u64))
+        .collect();
+
+    let src = appsrc.clone().dynamic_cast::<gst_app::AppSrc>().unwrap();
+    for pts in &input_pts {
+        let mut buf = gst::Buffer::from_slice(b"payload".to_vec());
+        buf.get_mut().unwrap().set_pts(*pts);
+        buf.get_mut().unwrap().set_dts(*pts);
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let observed = received.lock().unwrap().clone();
+    assert_eq!(
+        observed.len(),
+        input_pts.len(),
+        "mux should emit one wire frame per input buffer"
+    );
+    for (i, (out, inp)) in observed.iter().zip(input_pts.iter()).enumerate() {
+        assert_eq!(
+            *out,
+            *inp + base_time,
+            "frame {}: wire PTS must equal input PTS + pipeline base_time",
+            i
+        );
+    }
+}
+
+/// End-to-end: mux in absolute mode + demux in rebase mode, both in the same
+/// pipeline. Since mux adds base_time and demux subtracts the same base_time,
+/// the round-trip is the identity transform — downstream sees the input
+/// running-time unchanged, even though the wire carried absolute clock-time.
+#[test]
+fn mux_abs_to_demux_rebase_roundtrips_running_time() {
+    init();
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = gst::ElementFactory::make("appsrc")
+        .property("format", gst::Format::Time)
+        .property("is-live", false)
+        .build()
+        .unwrap();
+    let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+    mux.set_property_from_str("timestamp-mode", "absolute-from-running-time");
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+    demux.set_property_from_str("normalize-segment", "rebase-to-running-time");
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("async", false)
+        .property("sync", false)
+        .build()
+        .unwrap();
+
+    let caps = gst::Caps::builder("application/x-efp-private")
+        .field("content-type", 0x20i32)
+        .build();
+    appsrc.set_property("caps", &caps);
+
+    pipeline
+        .add_many([&appsrc, &mux, &demux, &appsink])
+        .unwrap();
+    appsrc.link(&mux).unwrap();
+    mux.link(&demux).unwrap();
+
+    let appsink_cast = appsink.clone().dynamic_cast::<gst_app::AppSink>().unwrap();
+    let received = Arc::new(Mutex::new(Vec::<gst::ClockTime>::new()));
+    let received_cb = Arc::clone(&received);
+    appsink_cast.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                if let Some(pts) = sample.buffer().and_then(|b| b.pts()) {
+                    received_cb.lock().unwrap().push(pts);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let appsink_weak = appsink.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        if !pad.name().starts_with("src_") {
+            return;
+        }
+        if let Some(sink) = appsink_weak.upgrade() {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            if !sinkpad.is_linked() {
+                pad.link(&sinkpad).unwrap();
+            }
+        }
+    });
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    // Push small running-time PTS values. The mux will add base_time on the
+    // wire, and the demux will subtract it on the way out — round-trip is
+    // expected to reproduce these exact values.
+    let input_pts: Vec<gst::ClockTime> = (0..3)
+        .map(|i| gst::ClockTime::from_mseconds(40 * i as u64))
+        .collect();
+
+    let src = appsrc.clone().dynamic_cast::<gst_app::AppSrc>().unwrap();
+    for pts in &input_pts {
+        let mut buf = gst::Buffer::from_slice(b"payload".to_vec());
+        buf.get_mut().unwrap().set_pts(*pts);
+        buf.get_mut().unwrap().set_dts(*pts);
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let rx = received.lock().unwrap().clone();
+    assert_eq!(
+        rx, input_pts,
+        "abs-mux → rebase-demux round-trip must reproduce the input running-time PTS exactly"
+    );
+}
+
+/// Auto mode on a wall-clock pipeline must resolve to RebaseToRunningTime
+/// (not legacy passthrough). Verifies the output PTS is small running-time,
+/// which is only true if the demux subtracted base_time.
+#[test]
+fn normalize_segment_auto_realtime_rebases_to_small_pts() {
+    init();
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = gst::ElementFactory::make("appsrc")
+        .property("format", gst::Format::Time)
+        .property("is-live", false)
+        .build()
+        .unwrap();
+    let mux = gst::ElementFactory::make("efpmux").build().unwrap();
+    mux.set_property_from_str("timestamp-mode", "absolute-from-running-time");
+    let demux = gst::ElementFactory::make("efpdemux").build().unwrap();
+    // Auto is the default — state it explicitly for the reader.
+    demux.set_property_from_str("normalize-segment", "auto");
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("async", false)
+        .property("sync", false)
+        .build()
+        .unwrap();
+
+    // Fresh Realtime SystemClock (does not touch the global singleton).
+    let clock: gst::SystemClock = glib::Object::builder()
+        .property("clock-type", gst::ClockType::Realtime)
+        .build();
+    pipeline.use_clock(Some(&clock));
+
+    let caps = gst::Caps::builder("application/x-efp-private")
+        .field("content-type", 0x20i32)
+        .build();
+    appsrc.set_property("caps", &caps);
+
+    pipeline
+        .add_many([&appsrc, &mux, &demux, &appsink])
+        .unwrap();
+    appsrc.link(&mux).unwrap();
+    mux.link(&demux).unwrap();
+
+    let appsink_cast = appsink.clone().dynamic_cast::<gst_app::AppSink>().unwrap();
+    let received = Arc::new(Mutex::new(Vec::<gst::ClockTime>::new()));
+    let received_cb = Arc::clone(&received);
+    appsink_cast.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                if let Some(pts) = sample.buffer().and_then(|b| b.pts()) {
+                    received_cb.lock().unwrap().push(pts);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let appsink_weak = appsink.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        if !pad.name().starts_with("src_") {
+            return;
+        }
+        if let Some(sink) = appsink_weak.upgrade() {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            if !sinkpad.is_linked() {
+                pad.link(&sinkpad).unwrap();
+            }
+        }
+    });
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    let input_pts: Vec<gst::ClockTime> = (0..3)
+        .map(|i| gst::ClockTime::from_mseconds(40 * i as u64))
+        .collect();
+
+    let src = appsrc.clone().dynamic_cast::<gst_app::AppSrc>().unwrap();
+    for pts in &input_pts {
+        let mut buf = gst::Buffer::from_slice(b"payload".to_vec());
+        buf.get_mut().unwrap().set_pts(*pts);
+        buf.get_mut().unwrap().set_dts(*pts);
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).unwrap();
+
+    let rx = received.lock().unwrap().clone();
+    assert_eq!(
+        rx, input_pts,
+        "auto + realtime clock must resolve to RebaseToRunningTime and reproduce input running-time PTS"
     );
 }

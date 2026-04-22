@@ -3,6 +3,8 @@ use gst::prelude::*;
 
 mod imp;
 
+pub use imp::TimestampMode;
+
 glib::wrapper! {
     pub struct EfpMux(ObjectSubclass<imp::EfpMux>) @extends gst::Element, gst::Object;
 }

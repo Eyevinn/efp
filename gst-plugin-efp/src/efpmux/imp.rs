@@ -8,17 +8,73 @@ use gst::subclass::prelude::*;
 
 const DEFAULT_MTU: u32 = 1400;
 
+/// Controls what value is written as the EFP wire PTS/DTS for each frame.
+///
+/// # Clock-time, not TAI specifically
+///
+/// EFP wire timestamps are **pipeline-clock values** — whatever the pipeline
+/// clock reads at the moment of stamping. Whether that's TAI, UTC, PTP, NTP,
+/// or monotonic depends on how the user configured the pipeline clock, and
+/// how the host OS clock is disciplined (chrony, `ptp4l`/`phc2sys`, etc.).
+/// EFP makes no claim about the interpretation; the "absolute" modes below
+/// simply mean "matches the pipeline clock's reading at stamp time".
+///
+/// In the **common deployment** both ends run `clock-type=TAI` with chrony
+/// or PTP disciplining the OS clock, so EFP timestamps end up being
+/// absolute TAI. But the mechanism works for any clock choice as long as
+/// sender and receiver share a time domain.
+///
+/// # Why these modes exist
+///
+/// The simplest way to put absolute pipeline-clock time on the wire is to
+/// run the pipeline in direct-media-timing mode (`base_time=0`, so
+/// `buffer.pts == clock.time()`). That breaks many pipelines though
+/// (MPEG-TS demuxers, WHEP session sinks, aggregators assuming running-time
+/// starts near 0). `AbsoluteFromRunningTime` bridges the gap: it reads
+/// running-time PTS from the buffer and adds the pipeline's `base_time`
+/// to produce the absolute value on the wire, while the rest of the
+/// pipeline keeps working in normal running-time mode.
+///
+/// # Modes
+///
+/// - `Buffer` (default): pass `buffer.pts` / `buffer.dts` through unchanged.
+///   Keeps the legacy wire semantics (running-time). Use this when feeding a
+///   legacy receiver, or when the pipeline is in direct-media-timing mode
+///   (where `buffer.pts` already *is* the absolute pipeline-clock time).
+/// - `AbsoluteFromRunningTime` (recommended for cross-node sync): add the
+///   pipeline's `base_time` to the incoming running-time PTS/DTS, producing
+///   an absolute pipeline-clock timestamp on the wire. Pair with efpdemux's
+///   `RebaseToRunningTime` on the receiver side for cross-node alignment
+///   without forcing the pipeline into direct-media-timing mode.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Default, glib::Enum)]
+#[enum_type(name = "GstEfpMuxTimestampMode")]
+#[repr(i32)]
+pub enum TimestampMode {
+    #[enum_value(name = "Passthrough buffer PTS/DTS", nick = "buffer")]
+    Buffer = 0,
+    #[enum_value(
+        name = "Running time + pipeline base_time (absolute pipeline-clock)",
+        nick = "absolute-from-running-time"
+    )]
+    #[default]
+    AbsoluteFromRunningTime = 1,
+}
+
 // ---------------------------------------------------------------------------
 // Settings & internal state
 // ---------------------------------------------------------------------------
 
 struct Settings {
     mtu: u32,
+    timestamp_mode: TimestampMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mtu: DEFAULT_MTU }
+        Self {
+            mtu: DEFAULT_MTU,
+            timestamp_mode: TimestampMode::default(),
+        }
     }
 }
 
@@ -140,14 +196,34 @@ impl ObjectSubclass for EfpMux {
 impl ObjectImpl for EfpMux {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
-            vec![glib::ParamSpecUInt::builder("mtu")
-                .nick("MTU")
-                .blurb("Maximum Transmission Unit for EFP fragments (bytes)")
-                .minimum(100)
-                .maximum(65535)
-                .default_value(DEFAULT_MTU)
-                .mutable_ready()
-                .build()]
+            vec![
+                glib::ParamSpecUInt::builder("mtu")
+                    .nick("MTU")
+                    .blurb("Maximum Transmission Unit for EFP fragments (bytes)")
+                    .minimum(100)
+                    .maximum(65535)
+                    .default_value(DEFAULT_MTU)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecEnum::builder::<TimestampMode>("timestamp-mode")
+                    .nick("Timestamp mode")
+                    .blurb(
+                        "How to derive the wire PTS/DTS for each frame. \
+                        'buffer' (default) passes the incoming buffer PTS/DTS \
+                        through unchanged — correct when the pipeline is in \
+                        direct-media-timing mode, or when the receiver does \
+                        not need absolute time. \
+                        'absolute-from-running-time' adds the pipeline's \
+                        base_time to the incoming timestamps, so the wire \
+                        carries absolute pipeline-clock values (which is TAI \
+                        when the pipeline runs on a TAI system clock, etc.). \
+                        Use this on any pipeline that is not in \
+                        direct-media-timing mode when you want receivers to \
+                        see absolute sender clock-time.",
+                    )
+                    .mutable_ready()
+                    .build(),
+            ]
         });
         PROPERTIES.as_ref()
     }
@@ -155,6 +231,7 @@ impl ObjectImpl for EfpMux {
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "mtu" => self.settings.lock().unwrap().mtu = value.get().unwrap(),
+            "timestamp-mode" => self.settings.lock().unwrap().timestamp_mode = value.get().unwrap(),
             _ => unimplemented!(),
         }
     }
@@ -162,6 +239,7 @@ impl ObjectImpl for EfpMux {
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         match pspec.name() {
             "mtu" => self.settings.lock().unwrap().mtu.to_value(),
+            "timestamp-mode" => self.settings.lock().unwrap().timestamp_mode.to_value(),
             _ => unimplemented!(),
         }
     }
@@ -373,8 +451,30 @@ impl EfpMux {
         };
 
         // EFP reserves u64::MAX for PTS/DTS; use 0 when GStreamer has no timestamp.
-        let pts = buffer.pts().map_or(0, |t| t.nseconds());
-        let dts = buffer.dts().map_or(0, |t| t.nseconds());
+        // In AbsoluteFromRunningTime mode, add the pipeline's base_time to map
+        // running-time buffer PTS/DTS back to absolute pipeline-clock values
+        // on the wire. With a TAI-configured pipeline clock (chrony-/PTP-
+        // disciplined), those are absolute TAI — but the mechanism itself is
+        // clock-agnostic: it embeds whatever clock-time the local pipeline
+        // runs on. See efpdemux `RebaseToRunningTime` for the inverse at the
+        // receiver.
+        let timestamp_mode = self.settings.lock().unwrap().timestamp_mode;
+        let base_time_ns = match timestamp_mode {
+            TimestampMode::Buffer => 0,
+            TimestampMode::AbsoluteFromRunningTime => {
+                self.obj().base_time().map(|b| b.nseconds()).unwrap_or(0)
+            }
+        };
+        // When the buffer has no DTS (common for raw video sources) we must
+        // derive one from PTS — EFP's protocol check rejects frames where
+        // `pts - dts >= u32::MAX` (~4.3s). Defaulting DTS to 0 worked before
+        // only because PTS was small (running-time). Now that PTS can carry
+        // absolute pipeline-clock values, `0` gives a huge diff. Using PTS as
+        // the fallback DTS makes the diff zero, which is always safe.
+        let buffer_pts = buffer.pts();
+        let buffer_dts = buffer.dts().or(buffer_pts);
+        let pts = buffer_pts.map_or(0, |t| t.nseconds().saturating_add(base_time_ns));
+        let dts = buffer_dts.map_or(0, |t| t.nseconds().saturating_add(base_time_ns));
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
         // Prepend any pending embedded data for this stream.

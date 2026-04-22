@@ -1,7 +1,7 @@
 use gst::glib;
 
 pub mod efpdemux;
-mod efpmux;
+pub mod efpmux;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     efpmux::register(plugin)?;

@@ -8,17 +8,64 @@ use gst::subclass::prelude::*;
 const DEFAULT_BUCKET_TIMEOUT: u32 = 5;
 const DEFAULT_HOL_TIMEOUT: u32 = 5;
 
-/// Controls whether the demuxer rewrites the outgoing segment start so that
-/// running-time begins near 0 on each pad, even when the incoming PTS carries
-/// a large absolute offset from the sender.
+/// Controls how PTS values in the EFP container are mapped to outgoing
+/// buffer PTS on each source pad.
 ///
-/// - `Auto`: decide based on the pipeline clock. A monotonic system clock (or
-///   no clock) means the user has not signalled interest in absolute time, so
-///   the segment is normalized. A realtime/TAI system clock or a network clock
-///   (NTP/PTP/net-client) means running-time should carry absolute pipeline
-///   time so downstream blocks can synchronize across demux instances.
-/// - `Always`: normalize unconditionally (pre-existing behaviour).
-/// - `Never`: never rewrite the segment. Running-time equals absolute PTS.
+/// # Clock-time, not TAI specifically
+///
+/// EFP wire timestamps are **pipeline-clock values** — i.e. whatever the
+/// sender's GStreamer pipeline clock read when the frame was stamped. Whether
+/// that clock is TAI, UTC, PTP, NTP, or monotonic depends entirely on how the
+/// sender configured its pipeline, and how (or whether) the host OS clock is
+/// disciplined — by chrony, `ptp4l`/`phc2sys`, `systemd-timesyncd`, etc. The
+/// EFP container itself makes no claim about what the timestamp represents;
+/// that agreement lives outside the protocol.
+///
+/// In the **common deployment** two nodes configure their pipelines with
+/// `clock-type=TAI` and discipline the OS clock via chrony or PTP, so EFP
+/// wire timestamps are absolute TAI. The modes below use "absolute" to mean
+/// "matches the sender's pipeline-clock reading at stamp time" — with a
+/// TAI-configured sender, that's absolute TAI.
+///
+/// # Why these modes exist
+///
+/// To carry absolute pipeline-clock time on the EFP wire, the sender must
+/// either run its pipeline in direct-media-timing mode (`base_time=0`, so
+/// `running_time == clock.time()`) or explicitly translate its
+/// running-time PTS into absolute values at the mux (see efpmux's
+/// `AbsoluteFromRunningTime`). The receiver faces the inverse problem:
+/// feeding absolute timestamps into downstream elements that expect normal
+/// running-time. `RebaseToRunningTime` lets us preserve sender-absolute
+/// timing while keeping the local pipeline in its normal (non-wall-clock)
+/// timing regime, so WHEP, mixers, MPEG-TS demuxers etc. keep working.
+///
+/// # Modes
+///
+/// - `Auto` (default): decide based on the local pipeline clock.
+///   - No clock assigned: `Always` (legacy-safe).
+///   - `GstSystemClock` with `clock-type=Monotonic`: `Always`. A monotonic
+///     sender and a monotonic receiver don't share a time domain, so
+///     absolute PTS can't be reconciled across nodes — normalize locally.
+///   - Any other clock (TAI, Realtime, NTP, PTP, `GstNetClientClock`):
+///     `RebaseToRunningTime`. These clocks put sender and receiver in a
+///     shared time domain, so the rebase gives a well-defined running-time
+///     for mixer synchronisation regardless of whether the pipeline is in
+///     direct-media-timing mode.
+/// - `Always`: rewrite segment start so running-time begins near 0 on each
+///   pad (pre-existing legacy behaviour for monotonic playout).
+/// - `Never`: never rewrite the segment. Running-time equals absolute PTS —
+///   only meaningful when the pipeline runs in direct-media-timing mode
+///   (`base_time=0`), otherwise running-time gets out of sync with the
+///   pipeline clock.
+/// - `RebaseToRunningTime`: subtract the pipeline's `base_time` from each
+///   incoming absolute PTS before stamping the buffer, so `buffer.pts`
+///   carries normal running-time (small values). Multiple EFP demux
+///   instances on the same pipeline subtract the same `base_time`, so two
+///   senders that stamped the same clock-time map to the same running-time
+///   — which makes vision/audio mixers synchronise EFP sources on
+///   absolute sender time **without** the pipeline itself having to run in
+///   wall-clock mode. Equivalent to `Never` when the pipeline *is* in
+///   direct-media-timing mode (`base_time=0`).
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Default, glib::Enum)]
 #[enum_type(name = "GstEfpNormalizeSegment")]
 #[repr(i32)]
@@ -30,6 +77,11 @@ pub enum NormalizeSegment {
     Always = 1,
     #[enum_value(name = "Never normalize segment start", nick = "never")]
     Never = 2,
+    #[enum_value(
+        name = "Rebase absolute clock-time PTS to pipeline running time",
+        nick = "rebase-to-running-time"
+    )]
+    RebaseToRunningTime = 3,
 }
 
 /// Maximum adapter buffer size (16 MiB). Reject input beyond this to prevent
@@ -462,33 +514,37 @@ impl EfpDemux {
         Ok(gst::FlowSuccess::Ok)
     }
 
-    /// Decide whether to rewrite segment start on the outgoing pads.
+    /// Resolve `Auto` to a concrete mode based on the pipeline clock; leave
+    /// explicit modes unchanged.
     ///
-    /// `Always` / `Never` are honored directly. In `Auto` mode the pipeline
-    /// clock tells us whether the user cares about absolute time:
-    /// - No clock assigned yet → normalize (safe default, matches legacy)
-    /// - GstPtpClock / GstNtpClock / GstNetClientClock → absolute time, passthrough
-    /// - GstSystemClock with clock-type=Monotonic → passthrough disabled, normalize
-    /// - GstSystemClock with clock-type=Realtime/TAI → absolute time, passthrough
-    /// - Any other clock subclass → normalize (legacy-safe default)
-    fn should_normalize_segment(&self) -> bool {
+    /// Monotonic clocks can't reconcile sender/receiver time domains, so
+    /// they normalize. Wall-clock clocks (TAI/Realtime/NTP/PTP/net-client)
+    /// rebase the absolute PTS into local running-time — which is a no-op
+    /// when the pipeline is already in direct-media-timing mode and
+    /// preserves cross-source synchronisation otherwise.
+    fn effective_mode(&self) -> NormalizeSegment {
         let mode = self.settings.lock().unwrap().normalize_segment;
-        match mode {
-            NormalizeSegment::Always => true,
-            NormalizeSegment::Never => false,
-            NormalizeSegment::Auto => {
-                let Some(clock) = self.obj().clock() else {
-                    return true;
-                };
-                match clock.type_().name() {
-                    "GstPtpClock" | "GstNtpClock" | "GstNetClientClock" => false,
-                    "GstSystemClock" => matches!(
-                        clock.property::<gst::ClockType>("clock-type"),
-                        gst::ClockType::Monotonic
-                    ),
-                    _ => true,
+        if mode != NormalizeSegment::Auto {
+            return mode;
+        }
+        let Some(clock) = self.obj().clock() else {
+            return NormalizeSegment::Always;
+        };
+        match clock.type_().name() {
+            "GstPtpClock" | "GstNtpClock" | "GstNetClientClock" => {
+                NormalizeSegment::RebaseToRunningTime
+            }
+            "GstSystemClock" => {
+                if matches!(
+                    clock.property::<gst::ClockType>("clock-type"),
+                    gst::ClockType::Monotonic
+                ) {
+                    NormalizeSegment::Always
+                } else {
+                    NormalizeSegment::RebaseToRunningTime
                 }
             }
+            _ => NormalizeSegment::Always,
         }
     }
 
@@ -506,6 +562,28 @@ impl EfpDemux {
             }
         };
 
+        // Optionally rebase absolute sender-side clock-time PTS/DTS into the
+        // local pipeline's running-time domain. See
+        // NormalizeSegment::RebaseToRunningTime — this lets us keep the
+        // pipeline in its normal timing regime (not wall-clock / not
+        // direct-media-timing) while preserving sender-to-receiver frame
+        // alignment across multiple EFP sources.
+        let mode = self.effective_mode();
+        let (effective_pts, effective_dts) =
+            if matches!(mode, NormalizeSegment::RebaseToRunningTime) {
+                let base_time = self.obj().base_time().map(|b| b.nseconds()).unwrap_or(0);
+                let rebase = |t: u64| {
+                    if t == u64::MAX {
+                        t
+                    } else {
+                        t.saturating_sub(base_time)
+                    }
+                };
+                (rebase(frame.pts), rebase(frame.dts))
+            } else {
+                (frame.pts, frame.dts)
+            };
+
         // Update segment start when we see the first PTS for this pad, so that
         // downstream running-time starts near 0 instead of using the raw PTS
         // (which may carry a large offset from the sender). Mirrors tsdemux.
@@ -514,11 +592,15 @@ impl EfpDemux {
         // running-time, so this behaviour is controlled by the
         // `normalize-segment` property (see `NormalizeSegment`).
         //
-        // The cheap `need_update` check is evaluated first; the settings /
-        // pipeline-clock inspection in `should_normalize_segment` only runs
-        // when a rewrite is actually pending (once per pad in practice).
-        if frame.pts != u64::MAX {
-            let pts = gst::ClockTime::from_nseconds(frame.pts);
+        // The cheap `need_update` check is evaluated first; the mode
+        // inspection only matters once per pad when a rewrite is pending.
+        //
+        // In `RebaseToRunningTime` mode `effective_pts` is already small
+        // (relative to pipeline base_time), so this branch never triggers —
+        // segment stays at its default (start=0, base=0) which is what we
+        // want for the rebased timestamps.
+        if effective_pts != u64::MAX {
+            let pts = gst::ClockTime::from_nseconds(effective_pts);
             let need_update = {
                 let seg = srcpad.sticky_event::<gst::event::Segment>(0);
                 match seg {
@@ -535,7 +617,7 @@ impl EfpDemux {
                     None => false,
                 }
             };
-            if need_update && self.should_normalize_segment() {
+            if need_update && matches!(mode, NormalizeSegment::Always) {
                 let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
                 segment.set_start(pts);
                 segment.set_position(pts);
@@ -546,11 +628,11 @@ impl EfpDemux {
         let mut buffer = gst::Buffer::from_mut_slice(frame.data);
         {
             let buf_ref = buffer.get_mut().unwrap();
-            if frame.pts != u64::MAX {
-                buf_ref.set_pts(gst::ClockTime::from_nseconds(frame.pts));
+            if effective_pts != u64::MAX {
+                buf_ref.set_pts(gst::ClockTime::from_nseconds(effective_pts));
             }
-            if frame.dts != u64::MAX {
-                buf_ref.set_dts(gst::ClockTime::from_nseconds(frame.dts));
+            if effective_dts != u64::MAX {
+                buf_ref.set_dts(gst::ClockTime::from_nseconds(effective_dts));
             }
             if needs_discont {
                 buf_ref.set_flags(gst::BufferFlags::DISCONT);
@@ -566,11 +648,25 @@ impl EfpDemux {
     fn push_embedded(&self, emb: efp::EmbeddedData) -> Result<gst::FlowSuccess, gst::FlowError> {
         let pad = self.get_or_create_embedded_pad(emb.data_type)?;
 
+        // Same rebase logic as push_frame: in RebaseToRunningTime mode, subtract
+        // pipeline base_time so embedded-data PTS matches running-time.
+        let mode = self.effective_mode();
+        let effective_pts = if matches!(mode, NormalizeSegment::RebaseToRunningTime) {
+            let base_time = self.obj().base_time().map(|b| b.nseconds()).unwrap_or(0);
+            if emb.pts == u64::MAX {
+                emb.pts
+            } else {
+                emb.pts.saturating_sub(base_time)
+            }
+        } else {
+            emb.pts
+        };
+
         let mut buffer = gst::Buffer::from_mut_slice(emb.data);
         {
             let buf_ref = buffer.get_mut().unwrap();
-            if emb.pts != u64::MAX {
-                buf_ref.set_pts(gst::ClockTime::from_nseconds(emb.pts));
+            if effective_pts != u64::MAX {
+                buf_ref.set_pts(gst::ClockTime::from_nseconds(effective_pts));
             }
         }
 

@@ -280,7 +280,31 @@ impl ElementImpl for EfpMux {
             )
             .unwrap();
 
-            let sink_caps = gst::Caps::new_any();
+            // Enumerate accepted sink caps. Video types are pinned to
+            // byte-stream + AU alignment so upstream parsers (h264parse /
+            // h265parse) negotiate the wire format we actually transport —
+            // the receiver's efpdemux unconditionally advertises byte-stream
+            // on its src pads, so avc-framed bytes break h264parse downstream.
+            // Opus is natively recognized (CONTENT_OPUS). Anything else must
+            // be wrapped as `application/x-efp-private` by the caller; that
+            // single choice replaces the former `ANY` to make the wire
+            // contract explicit at the plugin boundary.
+            let sink_caps = gst::Caps::builder_full()
+                .structure(
+                    gst::Structure::builder("video/x-h264")
+                        .field("stream-format", "byte-stream")
+                        .field("alignment", "au")
+                        .build(),
+                )
+                .structure(
+                    gst::Structure::builder("video/x-h265")
+                        .field("stream-format", "byte-stream")
+                        .field("alignment", "au")
+                        .build(),
+                )
+                .structure(gst::Structure::builder("audio/x-opus").build())
+                .structure(gst::Structure::builder("application/x-efp-private").build())
+                .build();
             let sink_template = gst::PadTemplate::new(
                 "sink_%u",
                 gst::PadDirection::Sink,

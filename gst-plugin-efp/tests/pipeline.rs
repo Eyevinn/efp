@@ -40,8 +40,14 @@ fn run_pipeline(pipeline_str: &str) {
 }
 
 #[test]
-fn raw_video_roundtrip() {
-    run_pipeline("videotestsrc num-buffers=30 ! efpmux ! efpdemux ! fakesink");
+fn private_data_roundtrip() {
+    // Non-standard payloads (raw video here) must be wrapped as
+    // `application/x-efp-private` — that's the efpmux contract for anything
+    // outside the natively-recognized {H.264, H.265, Opus} set.
+    run_pipeline(
+        "videotestsrc num-buffers=30 ! capssetter caps=application/x-efp-private join=false replace=true \
+         ! efpmux ! efpdemux ! fakesink",
+    );
 }
 
 #[test]
@@ -64,8 +70,64 @@ fn opus_roundtrip() {
 fn custom_mtu() {
     run_pipeline(
         "videotestsrc num-buffers=10 ! video/x-raw,width=160,height=120 \
+         ! capssetter caps=application/x-efp-private join=false replace=true \
          ! efpmux mtu=500 ! efpdemux ! fakesink",
     );
+}
+
+/// The efpmux sink template pins H.264 to byte-stream + AU alignment, which
+/// forces h264parse to negotiate byte-stream regardless of upstream preference.
+/// This protects the wire from avc-framed bytes that would later fail in the
+/// receiver-side h264parse (which only sees byte-stream caps).
+#[test]
+fn mux_sink_template_forces_h264_byte_stream() {
+    init();
+
+    let pipeline = gst::parse::launch(
+        "videotestsrc num-buffers=5 ! video/x-raw,width=160,height=120,framerate=25/1 \
+         ! x264enc tune=zerolatency ! h264parse ! efpmux name=mux ! fakesink",
+    )
+    .unwrap();
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    // Wait for negotiation to settle. EOS arrives quickly with 5 buffers.
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(5)) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(..) => break,
+            MessageView::Error(err) => {
+                panic!("pipeline error: {} ({:?})", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+
+    // Inspect the mux's sink pad caps — must be byte-stream after negotiation.
+    let mux = pipeline
+        .downcast_ref::<gst::Pipeline>()
+        .unwrap()
+        .by_name("mux")
+        .expect("mux element in pipeline");
+    let sink_pad = mux
+        .iterate_sink_pads()
+        .into_iter()
+        .find_map(|p| p.ok())
+        .expect("mux has a sink pad after playing");
+    let caps = sink_pad
+        .current_caps()
+        .expect("negotiated caps on mux sink pad");
+    let structure = caps.structure(0).expect("caps has at least one structure");
+    assert_eq!(structure.name(), "video/x-h264");
+    assert_eq!(
+        structure.get::<String>("stream-format").unwrap(),
+        "byte-stream",
+        "efpmux sink must negotiate byte-stream (got {:?})",
+        structure.get::<String>("stream-format")
+    );
+
+    pipeline.set_state(gst::State::Null).unwrap();
 }
 
 #[test]
@@ -74,6 +136,7 @@ fn buffer_data_integrity() {
 
     let pipeline = gst::parse::launch(
         "videotestsrc num-buffers=5 pattern=0 ! video/x-raw,format=RGB,width=4,height=4 \
+         ! capssetter caps=application/x-efp-private join=false replace=true \
          ! efpmux ! efpdemux ! appsink name=sink",
     )
     .unwrap();

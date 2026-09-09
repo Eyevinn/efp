@@ -284,6 +284,14 @@ fn embedded_data_roundtrip() {
     );
     assert_eq!(e[0].data, embed_payload);
     assert_eq!(e[0].data_type, 42);
+    assert_eq!(
+        e[0].stream_id, 1,
+        "embedded data must carry the stream its frame arrived on"
+    );
+    assert_eq!(
+        f[0].data, frame_payload,
+        "the embedded preamble must be stripped from the media payload"
+    );
 }
 
 #[test]

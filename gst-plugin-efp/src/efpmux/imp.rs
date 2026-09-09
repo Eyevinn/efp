@@ -6,6 +6,14 @@ use glib::subclass::prelude::*;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
+static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
+    gst::DebugCategory::new(
+        "efpmux",
+        gst::DebugColorFlags::empty(),
+        Some("Elastic Frame Protocol muxer"),
+    )
+});
+
 const DEFAULT_MTU: u32 = 1400;
 
 /// Controls what value is written as the EFP wire PTS/DTS for each frame.
@@ -85,10 +93,26 @@ struct PadState {
     eos: bool,
 }
 
+/// An embed pad's addressing, or `None` until caps carrying it have arrived.
+///
+/// Both fields used to default to 0 when absent. Stream 0 is never allocated to
+/// a sink pad, so data addressed to it was buffered by the muxer and never
+/// sent: no error, no data, and a map that grew for the life of the pipeline.
+/// Caps that do not carry both fields are now rejected instead.
 struct EmbedPadState {
+    addressing: Option<EmbedAddressing>,
+}
+
+#[derive(Clone, Copy)]
+struct EmbedAddressing {
     stream_id: u8,
     data_type: u8,
 }
+
+/// Upper bound on embedded blocks held for one stream while it waits for a
+/// media frame to ride out on. A stream that never carries media would
+/// otherwise grow this without limit.
+const MAX_PENDING_EMBEDS_PER_STREAM: usize = 64;
 
 struct MuxState {
     sender: efp::Sender,
@@ -152,6 +176,8 @@ pub struct EfpMux {
     /// 0-based counter for pad naming (GStreamer convention: sink_0, sink_1, ...).
     /// Separate from EFP stream IDs which start at 1.
     next_pad_index: Mutex<u32>,
+    /// 0-based counter for naming embed pads requested without caps.
+    next_embed_index: Mutex<u32>,
     src_setup_done: AtomicBool,
 }
 
@@ -184,6 +210,7 @@ impl ObjectSubclass for EfpMux {
             pending_embeds: Mutex::new(HashMap::new()),
             stream_ids: Mutex::new(StreamIdAllocator::new()),
             next_pad_index: Mutex::new(0),
+            next_embed_index: Mutex::new(0),
             src_setup_done: AtomicBool::new(false),
         }
     }
@@ -506,7 +533,15 @@ impl EfpMux {
             let mut embeds = self.pending_embeds.lock().unwrap();
             if let Some(pending) = embeds.remove(&stream_id) {
                 let mut combined = map.as_slice().to_vec();
-                for (i, emb) in pending.iter().enumerate() {
+                // `add_embedded_data` prepends, so build the chain back to
+                // front: the block queued last is written first and ends up
+                // last on the wire, which is where the last-block flag belongs.
+                //
+                // Iterating forward instead put that flag on the block the
+                // receiver reads first. The receiver stops at the flagged
+                // block, so with more than one block queued every earlier one
+                // was silently handed to the media stream as payload.
+                for (i, emb) in pending.iter().enumerate().rev() {
                     let is_last = i == pending.len() - 1;
                     combined = efp::add_embedded_data(&emb.data, &combined, emb.data_type, is_last)
                         .map_err(|_| gst::FlowError::Error)?;
@@ -633,19 +668,21 @@ impl EfpMux {
         name: Option<&str>,
         caps: Option<&gst::Caps>,
     ) -> Option<gst::Pad> {
-        // Extract stream-id and data-type from caps.
-        let (stream_id, data_type) = caps
-            .and_then(|c| c.structure(0))
-            .map(|s| {
-                let sid = s.get::<i32>("stream-id").unwrap_or(0) as u8;
-                let dt = s.get::<i32>("data-type").unwrap_or(0) as u8;
-                (sid, dt)
-            })
-            .unwrap_or((0, 0));
+        // Addressing may arrive with the request, or later as a caps event.
+        let addressing = caps.and_then(|c| c.structure(0)).and_then(embed_addressing);
 
-        let pad_name = name
-            .map(String::from)
-            .unwrap_or_else(|| format!("embed_{stream_id}"));
+        // Name from the caller's stream-id when it is known, and otherwise from
+        // a counter: deriving it from an unset stream-id gave every pad the
+        // name `embed_0`, so the second request collided and failed.
+        let pad_name = name.map(String::from).unwrap_or_else(|| match addressing {
+            Some(a) => format!("embed_{}", a.stream_id),
+            None => {
+                let mut next = self.next_embed_index.lock().unwrap();
+                let index = *next;
+                *next += 1;
+                format!("embed_{index}")
+            }
+        });
 
         let pad = gst::Pad::builder_from_template(templ)
             .name(pad_name)
@@ -658,16 +695,31 @@ impl EfpMux {
                 use gst::EventView;
                 match event.view() {
                     EventView::Caps(e) => {
-                        // Update stream-id and data-type from renegotiated caps.
-                        if let Some(s) = e.caps().structure(0) {
-                            let element = parent.unwrap().downcast_ref::<super::EfpMux>().unwrap();
-                            let imp = element.imp();
-                            if let Some(eps) = imp.embed_pads.lock().unwrap().get_mut(pad) {
-                                eps.stream_id =
-                                    s.get::<i32>("stream-id").unwrap_or(eps.stream_id as i32) as u8;
-                                eps.data_type =
-                                    s.get::<i32>("data-type").unwrap_or(eps.data_type as i32) as u8;
-                            }
+                        let element = parent.unwrap().downcast_ref::<super::EfpMux>().unwrap();
+                        let imp = element.imp();
+
+                        // Both fields are required. The template declares them
+                        // as [0,255] ranges, which only stops a non-fixed caps
+                        // event; caps that omit a field entirely still
+                        // intersect it, so reject them here rather than
+                        // address stream 0 by accident.
+                        let addressing = e.caps().structure(0).and_then(embed_addressing);
+                        let Some(addressing) = addressing else {
+                            gst::element_error!(
+                                element,
+                                gst::CoreError::Negotiation,
+                                [
+                                    "embed pad '{}' needs caps carrying both 'stream-id' and \
+                                     'data-type', got {}",
+                                    pad.name(),
+                                    e.caps()
+                                ]
+                            );
+                            return false;
+                        };
+
+                        if let Some(eps) = imp.embed_pads.lock().unwrap().get_mut(pad) {
+                            eps.addressing = Some(addressing);
                         }
                         true
                     }
@@ -678,13 +730,10 @@ impl EfpMux {
             })
             .build();
 
-        self.embed_pads.lock().unwrap().insert(
-            pad.clone(),
-            EmbedPadState {
-                stream_id,
-                data_type,
-            },
-        );
+        self.embed_pads
+            .lock()
+            .unwrap()
+            .insert(pad.clone(), EmbedPadState { addressing });
 
         self.obj().add_pad(&pad).ok()?;
         pad.set_active(true).ok()?;
@@ -696,26 +745,79 @@ impl EfpMux {
         pad: &gst::Pad,
         buffer: gst::Buffer,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let (stream_id, data_type) = {
+        let addressing = {
             let eps = self.embed_pads.lock().unwrap();
-            let state = eps.get(pad).ok_or(gst::FlowError::Error)?;
-            (state.stream_id, state.data_type)
+            eps.get(pad).ok_or(gst::FlowError::Error)?.addressing
         };
+
+        // No caps carrying stream-id and data-type have arrived, so there is no
+        // stream to address this to. Report it rather than pick a stream.
+        let Some(addressing) = addressing else {
+            gst::element_error!(
+                self.obj(),
+                gst::CoreError::Negotiation,
+                [
+                    "embed pad '{}' received a buffer before caps carrying \
+                     'stream-id' and 'data-type'",
+                    pad.name()
+                ]
+            );
+            return Err(gst::FlowError::NotNegotiated);
+        };
+
+        // Embedded data rides out on the next media frame of its stream, so a
+        // stream with no sink pad has nothing to carry it and the data would
+        // sit in `pending_embeds` for the life of the pipeline.
+        let stream_exists = self
+            .pads
+            .lock()
+            .unwrap()
+            .values()
+            .any(|ps| ps.stream_id == addressing.stream_id);
+        if !stream_exists {
+            gst::warning!(
+                CAT,
+                obj = pad,
+                "dropping embedded data addressed to stream {}, which carries no media",
+                addressing.stream_id
+            );
+            return Ok(gst::FlowSuccess::Ok);
+        }
 
         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
-        self.pending_embeds
-            .lock()
-            .unwrap()
-            .entry(stream_id)
-            .or_default()
-            .push(PendingEmbed {
-                data: map.as_slice().to_vec(),
-                data_type,
-            });
+        let mut embeds = self.pending_embeds.lock().unwrap();
+        let queue = embeds.entry(addressing.stream_id).or_default();
+        if queue.len() >= MAX_PENDING_EMBEDS_PER_STREAM {
+            gst::warning!(
+                CAT,
+                obj = pad,
+                "stream {} has {} embedded blocks waiting for a media frame; dropping the oldest",
+                addressing.stream_id,
+                queue.len()
+            );
+            queue.remove(0);
+        }
+        queue.push(PendingEmbed {
+            data: map.as_slice().to_vec(),
+            data_type: addressing.data_type,
+        });
 
         Ok(gst::FlowSuccess::Ok)
     }
+}
+
+/// Read an embed pad's addressing out of a caps structure.
+///
+/// Returns `None` unless both fields are present and in range, so a caller
+/// cannot silently address stream 0 by omitting them.
+fn embed_addressing(s: &gst::StructureRef) -> Option<EmbedAddressing> {
+    let stream_id = u8::try_from(s.get::<i32>("stream-id").ok()?).ok()?;
+    let data_type = u8::try_from(s.get::<i32>("data-type").ok()?).ok()?;
+    Some(EmbedAddressing {
+        stream_id,
+        data_type,
+    })
 }
 
 fn content_type_from_caps(name: &str) -> u8 {

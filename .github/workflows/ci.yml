@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      # The C++ EFP library lives in vendor/efp as a submodule and is compiled
+      # by efp-sys/build.rs, so a shallow checkout without it cannot build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            pkg-config \
+            libclang-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+
+      # The pipeline tests run real pipelines: x264enc comes from
+      # plugins-ugly, opusenc and appsrc/appsink from plugins-base and -good.
+      # Without these the tests fail on a missing element rather than skipping,
+      # which is deliberate — a test that skips silently guards nothing.
+      - name: Install GStreamer runtime plugins
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features

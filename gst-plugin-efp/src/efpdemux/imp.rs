@@ -141,7 +141,27 @@ pub struct EfpDemux {
     /// 0-based counter for pad naming (GStreamer convention: src_0, src_1, ...).
     /// Separate from EFP stream IDs which start at 1.
     next_pad_index: Mutex<u32>,
-    embedded_pad: Mutex<Option<gst::Pad>>,
+    /// One embedded-data src pad per EFP stream ID, plus the data type its
+    /// caps currently advertise so a change can be renegotiated rather than
+    /// silently carried under the first type seen.
+    embedded_pads: Mutex<HashMap<u8, EmbeddedPad>>,
+}
+
+struct EmbeddedPad {
+    pad: gst::Pad,
+    data_type: u8,
+}
+
+/// Caps for an embedded-data src pad.
+///
+/// `stream-id` is what lets a receiver attribute the data to a media stream;
+/// it is the field the demuxer could not previously supply, because the C API's
+/// embedded-data callback dropped it.
+fn embedded_caps(stream_id: u8, data_type: u8) -> gst::Caps {
+    gst::Caps::builder("application/x-efp-embedded")
+        .field("data-type", data_type as i32)
+        .field("stream-id", stream_id as i32)
+        .build()
 }
 
 unsafe impl Send for EfpDemux {}
@@ -177,7 +197,7 @@ impl ObjectSubclass for EfpDemux {
             srcpads: Mutex::new(HashMap::new()),
             srcpad_state: Mutex::new(HashMap::new()),
             next_pad_index: Mutex::new(0),
-            embedded_pad: Mutex::new(None),
+            embedded_pads: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -295,11 +315,17 @@ impl ElementImpl for EfpDemux {
             )
             .unwrap();
 
+            // One embedded pad per EFP stream, named for that stream, with the
+            // stream ID on the caps. A single `embedded` pad shared by every
+            // stream made the channel write-only: a sender could address data
+            // to a stream, but a receiver had no way to tell which stream a
+            // block described.
             let embed_caps = gst::Caps::builder("application/x-efp-embedded")
                 .field("data-type", gst::IntRange::new(0i32, 255i32))
+                .field("stream-id", gst::IntRange::new(0i32, 255i32))
                 .build();
             let embed_template = gst::PadTemplate::new(
-                "embedded",
+                "embedded_%u",
                 gst::PadDirection::Src,
                 gst::PadPresence::Sometimes,
                 &embed_caps,
@@ -382,8 +408,8 @@ impl EfpDemux {
         }
         self.srcpad_state.lock().unwrap().clear();
         *self.next_pad_index.lock().unwrap() = 0;
-        if let Some(pad) = self.embedded_pad.lock().unwrap().take() {
-            let _ = self.obj().remove_pad(&pad);
+        for (_, entry) in self.embedded_pads.lock().unwrap().drain() {
+            let _ = self.obj().remove_pad(&entry.pad);
         }
     }
 
@@ -646,7 +672,7 @@ impl EfpDemux {
     }
 
     fn push_embedded(&self, emb: efp::EmbeddedData) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let pad = self.get_or_create_embedded_pad(emb.data_type)?;
+        let pad = self.get_or_create_embedded_pad(emb.stream_id, emb.data_type)?;
 
         // Same rebase logic as push_frame: in RebaseToRunningTime mode, subtract
         // pipeline base_time so embedded-data PTS matches running-time.
@@ -673,30 +699,52 @@ impl EfpDemux {
         pad.push(buffer)
     }
 
-    fn get_or_create_embedded_pad(&self, data_type: u8) -> Result<gst::Pad, gst::FlowError> {
+    fn get_or_create_embedded_pad(
+        &self,
+        stream_id: u8,
+        data_type: u8,
+    ) -> Result<gst::Pad, gst::FlowError> {
+        // Fast path: the pad exists and already advertises this data type.
         {
-            let guard = self.embedded_pad.lock().unwrap();
-            if let Some(pad) = guard.as_ref() {
-                return Ok(pad.clone());
+            let pads = self.embedded_pads.lock().unwrap();
+            if let Some(existing) = pads.get(&stream_id) {
+                if existing.data_type == data_type {
+                    return Ok(existing.pad.clone());
+                }
             }
         }
 
-        let templ = self.obj().pad_template("embedded").unwrap();
+        // The pad exists but is carrying a different data type than its caps
+        // say. Renegotiate: a pad's caps used to be frozen at the first type
+        // seen, so later types flowed out under the wrong label.
+        let existing_pad = {
+            let pads = self.embedded_pads.lock().unwrap();
+            pads.get(&stream_id).map(|e| e.pad.clone())
+        };
+        if let Some(pad) = existing_pad {
+            pad.push_event(gst::event::Caps::new(&embedded_caps(stream_id, data_type)));
+            if let Some(entry) = self.embedded_pads.lock().unwrap().get_mut(&stream_id) {
+                entry.data_type = data_type;
+            }
+            return Ok(pad);
+        }
+
+        let templ = self.obj().pad_template("embedded_%u").unwrap();
         let pad = gst::Pad::builder_from_template(&templ)
-            .name("embedded")
+            .name(format!("embedded_{stream_id}"))
             .build();
 
         // Activate pad and push sticky events BEFORE add_pad so that
         // pad-added signal handlers can query caps to determine media type.
         pad.set_active(true).map_err(|_| gst::FlowError::Error)?;
 
-        let sid = format!("{:08x}-embedded", self.obj().as_ptr() as usize);
+        let sid = format!(
+            "{:08x}-embedded-{}",
+            self.obj().as_ptr() as usize,
+            stream_id
+        );
         pad.push_event(gst::event::StreamStart::new(&sid));
-
-        let caps = gst::Caps::builder("application/x-efp-embedded")
-            .field("data-type", data_type as i32)
-            .build();
-        pad.push_event(gst::event::Caps::new(&caps));
+        pad.push_event(gst::event::Caps::new(&embedded_caps(stream_id, data_type)));
 
         let segment = gst::FormattedSegment::<gst::ClockTime>::new();
         pad.push_event(gst::event::Segment::new(&segment));
@@ -705,7 +753,13 @@ impl EfpDemux {
             .add_pad(&pad)
             .map_err(|_| gst::FlowError::Error)?;
 
-        *self.embedded_pad.lock().unwrap() = Some(pad.clone());
+        self.embedded_pads.lock().unwrap().insert(
+            stream_id,
+            EmbeddedPad {
+                pad: pad.clone(),
+                data_type,
+            },
+        );
         Ok(pad)
     }
 
@@ -769,9 +823,13 @@ impl EfpDemux {
     /// the lock during downstream calls.
     fn srcpad_snapshot(&self) -> Vec<gst::Pad> {
         let mut pads: Vec<gst::Pad> = self.srcpads.lock().unwrap().values().cloned().collect();
-        if let Some(pad) = self.embedded_pad.lock().unwrap().as_ref() {
-            pads.push(pad.clone());
-        }
+        pads.extend(
+            self.embedded_pads
+                .lock()
+                .unwrap()
+                .values()
+                .map(|e| e.pad.clone()),
+        );
         pads
     }
 

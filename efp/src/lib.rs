@@ -381,6 +381,81 @@ pub struct EmbeddedData {
     pub data: Vec<u8>,
     pub data_type: u8,
     pub pts: u64,
+    /// EFP stream the carrying superframe belongs to.
+    ///
+    /// Embedded data rides on a media frame, so this is the stream that frame
+    /// was addressed to — what a receiver needs to attribute the data to a
+    /// media stream. See [`split_embedded_data`] for why it is recovered here
+    /// rather than taken from the C library's own embedded-data callback.
+    pub stream_id: u8,
+}
+
+/// Size of the C++ `ElasticEmbeddedHeader` as it appears on the wire.
+///
+/// `ElasticFrameProtocolSender::addEmbeddedData` copies the struct byte for
+/// byte, so the wire layout is the platform's struct layout: a `uint8_t` type
+/// at offset 0, one padding byte, then a `uint16_t` size at offset 2 in host
+/// byte order. Every EFP field wider than a byte is host-endian for the same
+/// reason, so this is consistent with the rest of the framing rather than a new
+/// assumption. `embedded_header_roundtrips_through_the_c_library` pins it.
+const EMBEDDED_HEADER_SIZE: usize = 4;
+
+/// Set on an embedded block's type byte to mark it the last one in the frame.
+const EMBEDDED_LAST: u8 = 0x80;
+
+/// Embedded blocks from one superframe, each as `(data_type, data)`.
+pub type EmbeddedBlocks = Vec<(u8, Vec<u8>)>;
+
+/// Split the embedded blocks off the front of a superframe payload.
+///
+/// Returns each block as `(data_type, data)` in wire order, plus the offset
+/// where the media payload begins.
+///
+/// This mirrors `ElasticFrameProtocolReceiver::extractEmbeddedData`, which the
+/// C library would otherwise run for us. It is reimplemented here for one
+/// reason: the C API's embedded-data callback takes
+/// `(data, size, data_type, pts, ctx)` and has no stream-ID parameter, even
+/// though the C++ side has the carrying frame in hand when it fires. Extracting
+/// on this side of the boundary keeps the frame and its embedded data together,
+/// so each block can be attributed to the stream it arrived on.
+///
+/// One deliberate difference from the C++: embedded data that exactly fills the
+/// frame is accepted and yields an empty media payload, where
+/// `extractEmbeddedData` reports `bufferOutOfBounds`. Nothing is lost by being
+/// lenient, and a caller that wants to reject it can check the payload length.
+pub fn split_embedded_data(payload: &[u8]) -> Result<(EmbeddedBlocks, usize)> {
+    let mut blocks = Vec::new();
+    let mut pos = 0usize;
+
+    loop {
+        let header = payload
+            .get(pos..pos + EMBEDDED_HEADER_SIZE)
+            .ok_or(EfpError::IllegalEmbeddedData)?;
+
+        let raw_type = header[0];
+        let data_type = raw_type & !EMBEDDED_LAST;
+        // Type 0 is `illegal` in the C++ enum. Checking the masked value also
+        // rejects a bare `0x80`, which would otherwise decode as type 0.
+        if data_type == 0 {
+            return Err(EfpError::IllegalEmbeddedData);
+        }
+
+        let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let start = pos + EMBEDDED_HEADER_SIZE;
+        let end = start
+            .checked_add(size)
+            .ok_or(EfpError::IllegalEmbeddedData)?;
+        let data = payload
+            .get(start..end)
+            .ok_or(EfpError::IllegalEmbeddedData)?;
+
+        blocks.push((data_type, data.to_vec()));
+        pos = end;
+
+        if raw_type & EMBEDDED_LAST != 0 {
+            return Ok((blocks, pos));
+        }
+    }
 }
 
 type SuperFrameCb = Box<dyn Fn(SuperFrame) + Send + Sync>;
@@ -423,8 +498,38 @@ unsafe extern "C" fn receiver_frame_trampoline(
         } else {
             unsafe { std::slice::from_raw_parts(data, size) }
         };
+
+        // Embedded data is extracted here rather than by the C library, so that
+        // it can be tagged with this frame's stream ID. The conditions match
+        // `ElasticFrameProtocolReceiver::gotData`: only when a callback wants
+        // the data, only when the sender flagged an inline payload, and never
+        // on a broken frame, whose preamble cannot be trusted.
+        let mut payload = slice;
+        if let Some(ref on_embedded) = ctx.on_embedded {
+            if flags & FLAG_INLINE_PAYLOAD != 0 && broken == 0 {
+                match split_embedded_data(slice) {
+                    Ok((blocks, payload_start)) => {
+                        payload = &slice[payload_start..];
+                        for (data_type, data) in blocks {
+                            on_embedded(EmbeddedData {
+                                data,
+                                data_type,
+                                pts,
+                                stream_id,
+                            });
+                        }
+                    }
+                    // A malformed preamble means the payload boundary is
+                    // unknown, so the frame would be delivered with embedded
+                    // bytes prepended to the media. The C++ drops the frame
+                    // here; do the same rather than emit corrupt media.
+                    Err(_) => return,
+                }
+            }
+        }
+
         let frame = SuperFrame {
-            data: slice.to_vec(),
+            data: payload.to_vec(),
             data_content,
             broken: broken != 0,
             pts,
@@ -435,34 +540,6 @@ unsafe extern "C" fn receiver_frame_trampoline(
             flags,
         };
         (ctx.on_frame)(frame);
-    }));
-    if result.is_err() {
-        std::process::abort();
-    }
-}
-
-unsafe extern "C" fn receiver_embedded_trampoline(
-    data: *mut u8,
-    size: usize,
-    data_type: u8,
-    pts: u64,
-    ctx: *mut c_void,
-) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let ctx = unsafe { &*(ctx as *const ReceiverCtx) };
-        if let Some(ref cb) = ctx.on_embedded {
-            let slice = if data.is_null() {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(data, size) }
-            };
-            let embedded = EmbeddedData {
-                data: slice.to_vec(),
-                data_type,
-                pts,
-            };
-            cb(embedded);
-        }
     }));
     if result.is_err() {
         std::process::abort();
@@ -512,21 +589,18 @@ impl Receiver {
         });
         let ctx_ptr: *const ReceiverCtx = &*ctx;
 
-        let embedded_cb = if ctx.on_embedded.is_some() {
-            Some(
-                receiver_embedded_trampoline
-                    as unsafe extern "C" fn(*mut u8, usize, u8, u64, *mut c_void),
-            )
-        } else {
-            None
-        };
-
+        // The C library's embedded-data callback is deliberately left
+        // unregistered, even when `on_embedded` is set. Registering it makes
+        // the C++ strip the embedded blocks before the frame callback runs and
+        // report them without a stream ID, so the two halves can no longer be
+        // paired. With it null the frame arrives whole and
+        // `receiver_frame_trampoline` splits it, keeping the stream ID.
         let handle = unsafe {
             efp_sys::efp_init_receive(
                 bucket_timeout,
                 hol_timeout,
                 Some(receiver_frame_trampoline),
-                embedded_cb,
+                None,
                 ctx_ptr as *mut c_void,
                 mode.as_raw(),
             )

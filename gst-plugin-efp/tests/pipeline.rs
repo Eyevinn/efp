@@ -468,7 +468,7 @@ fn embedded_data_output() {
                     pad.link(&sinkpad).unwrap();
                 }
             }
-        } else if name.as_str() == "embedded" {
+        } else if name.starts_with("embedded_") {
             if let Some(sink) = embed_sink_weak.upgrade() {
                 let sinkpad = sink.static_pad("sink").unwrap();
                 if !sinkpad.is_linked() {
@@ -501,6 +501,16 @@ fn embedded_data_output() {
         }
     }
 
+    // The frame was sent on stream 1, so the pad is named for that stream and
+    // its caps say so. Both were unavailable while every stream shared one
+    // `embedded` pad. Read before going to Null, which removes the pads.
+    let pad = demux
+        .static_pad("embedded_1")
+        .expect("the embedded pad should be named for the stream it carries");
+    let embed_caps = pad
+        .current_caps()
+        .expect("the embedded pad should have caps");
+
     pipeline.set_state(gst::State::Null).unwrap();
 
     let bufs = embed_buffers.lock().unwrap();
@@ -509,6 +519,10 @@ fn embedded_data_output() {
         "should have received embedded data on the embedded pad"
     );
     assert_eq!(bufs[0], embed_payload, "embedded data content should match");
+
+    let s = embed_caps.structure(0).unwrap();
+    assert_eq!(s.get::<i32>("stream-id").unwrap(), 1);
+    assert_eq!(s.get::<i32>("data-type").unwrap(), 42);
 }
 
 #[test]
@@ -883,7 +897,9 @@ fn mux_abs_mode_writes_absolute_wire_pts() {
     });
 
     pipeline.set_state(gst::State::Playing).unwrap();
-    let base_time = pipeline.base_time().expect("pipeline base_time after Playing");
+    let base_time = pipeline
+        .base_time()
+        .expect("pipeline base_time after Playing");
 
     let input_pts: Vec<gst::ClockTime> = (0..3)
         .map(|i| gst::ClockTime::from_mseconds(40 * i as u64))

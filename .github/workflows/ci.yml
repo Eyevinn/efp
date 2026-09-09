@@ -32,14 +32,16 @@ jobs:
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
 
-      # The pipeline tests run real pipelines: x264enc comes from
-      # plugins-ugly, opusenc and appsrc/appsink from plugins-base and -good.
-      # Without these the tests fail on a missing element rather than skipping,
-      # which is deliberate — a test that skips silently guards nothing.
+      # The pipeline tests run real pipelines: appsrc/appsink and opusenc come
+      # from plugins-base, videotestsrc/audiotestsrc/capssetter from -good,
+      # h264parse from -bad and x264enc from -ugly. Without these the tests
+      # fail on a missing element rather than skipping, which is deliberate —
+      # a test that skips silently guards nothing.
       - name: Install GStreamer runtime plugins
         run: |
           sudo apt-get install -y --no-install-recommends \
             gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-ugly
 

@@ -1,5 +1,4 @@
 use std::env;
-use std::path::PathBuf;
 
 fn main() {
     // Rebuild if the vendored C++ source changes.
@@ -24,8 +23,16 @@ fn main() {
         // MSVC links C++ runtime automatically
     }
 
+    #[cfg(feature = "bindgen")]
+    generate_bindings();
+}
+
+/// Writes freshly generated bindings to `OUT_DIR/bindings.rs`. The crate
+/// itself uses the checked-in `src/bindings.rs`; a test compares the two.
+#[cfg(feature = "bindgen")]
+fn generate_bindings() {
     // Generate bindings from the C API header
-    let efp_source = PathBuf::from("../vendor/efp");
+    let efp_source = std::path::PathBuf::from("../vendor/efp");
     let header = efp_source
         .join("efp_c_api")
         .join("elastic_frame_protocol_c_api.h");
@@ -39,7 +46,7 @@ fn main() {
         .generate()
         .expect("Unable to generate bindings");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_path = std::path::PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");

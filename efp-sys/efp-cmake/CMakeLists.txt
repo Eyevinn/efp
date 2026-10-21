@@ -17,7 +17,15 @@ target_include_directories(efp PUBLIC
 
 # GCC 15+ no longer implicitly includes <algorithm> via other headers.
 # The vendored EFP source uses std::copy_n without including it directly.
-target_compile_options(efp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include algorithm>)
+# MSVC has no -include: it forces a header with /FI. The cmake crate sets its
+# own CMAKE_CXX_FLAGS, which drop CMake's default /EHsc, and the vendored
+# source uses exceptions, so MSVC needs /EHsc as well.
+if(MSVC)
+    target_compile_options(efp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/FIalgorithm>)
+    target_compile_options(efp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+else()
+    target_compile_options(efp PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include algorithm>)
+endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(efp Threads::Threads)

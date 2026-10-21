@@ -21,6 +21,8 @@ jobs:
         with:
           submodules: recursive
 
+      # libclang-dev is for efp-sys's bindgen feature: --all-features turns it
+      # on, and a test checks the checked-in bindings against the C header.
       - name: Install build dependencies
         run: |
           sudo apt-get update

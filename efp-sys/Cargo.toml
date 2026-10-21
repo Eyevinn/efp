@@ -6,6 +6,12 @@ description = "FFI bindings to the Elastic Frame Protocol (EFP) C library"
 license = "MIT"
 links = "efp"
 
+[features]
+# Regenerate the bindings from the C header with bindgen (needs libclang).
+# Normal builds use the checked-in src/bindings.rs; with this feature on, a
+# test fails if that file no longer matches the header.
+bindgen = ["dep:bindgen"]
+
 [build-dependencies]
-bindgen = "0.71"
+bindgen = { version = "0.71", optional = true }
 cmake = "0.1"
